@@ -1,0 +1,14 @@
+## Interface: 16001
+## Title: LootLog
+## SavedVariables: LootLogDB
+Core.lua
+Capture.lua
+PageMobs.lua
+PageEvents.lua
+UI.lua
+Pagehunt.lua
+Seed_A_Neutral.lua
+ZoneData.lua
+Seed_A_Hostile.lua
+Seed_H_Neutral.lua
+Seed_H_Hostile.lua
