@@ -17,6 +17,19 @@ local seen, counted, names = ns.seen, ns.counted, ns.names
 local ITEM_SLOT = ns.ITEM_SLOT
 
 
+-- Redraws the window soon (at most every half second) if it is open. Used
+-- when new information arrives while you play, so an open Hunting Log keeps up.
+local refreshPending = false
+function ns.RequestRefresh()
+  if refreshPending then return end
+  refreshPending = true
+  C_Timer.After(0.5, function()
+    refreshPending = false
+    if ns.RefreshIfOpen then ns.RefreshIfOpen() end
+  end)
+end
+
+
 -- ===== MOB NAME CACHE =====
 -- A loot window gives us a GUID but no mob name. A GUID looks like:
 --   "Creature-0-1234-5678-9012-12345-0000ABCDEF"
@@ -38,7 +51,12 @@ local function CacheName(unit)
     local isPet = (ctype == "Non-combat Pet")
     if name and (UnitCanAttack("player", unit) or isPet)
        and not UnitIsPlayer(unit) and not UnitPlayerControlled(unit) then
+      local firstSight = not (ns.DB().known and ns.GetKnown(ns.DB(), npcID))
       local k = ns.TouchKnown(npcID, name)   -- find or create its record (Core.lua)
+      if firstSight then
+        ns.RequestRefresh()                        -- an open Hunting Log drops its "Unseen" tag
+        if ns.AnnounceSeen then ns.AnnounceSeen(npcID, name, ctype) end   -- a critter's first star (Messages.lua)
+      end
       -- Remember where it was seen: the zone, plus the sub-zone when that
       -- is also in the zone list (see ns.CurrentPlaces in Core.lua)
       for _, place in ipairs(ns.CurrentPlaces()) do
@@ -67,7 +85,11 @@ local function CacheName(unit)
       -- (elite, rare, worldboss...). The classification gives a default
       -- Elite / Rare / Boss tag; see ns.GetClass in Core.lua.
       k.ctype = ctype or k.ctype
-      k.uclass = UnitClassification(unit) or k.uclass
+      local newClass = UnitClassification(unit)
+      if newClass and newClass ~= k.uclass then
+        k.uclass = newClass
+        ns.RequestRefresh()   -- an open Hunting Log shows the new Elite / Rare / Boss tag right away
+      end
     end
   end
 end
@@ -123,8 +145,17 @@ local function RecordKill(guid, zone)
   local m = db.mobs[npcID] or { name = names[npcID], kills = 0, items = {} }
   m.name = m.name or names[npcID]
   m.zone = zone
+  -- Had you met it before this kill? (decides whether a critter's "seen" star is new)
+  local seenBefore = m.kills > 0 or (db.known ~= nil and db.known[npcID] ~= nil)
   ns.CountKill(m, zone)   -- adds 1 to m.kills AND to m.zones[zone]
   db.mobs[npcID] = m
+  -- Session totals (the Session page)
+  local sess = ns.session
+  sess.kills = sess.kills + 1
+  local who = m.name or names[npcID] or ("ID " .. npcID)
+  sess.mobKills[who] = (sess.mobKills[who] or 0) + 1
+  -- A chat message if this kill earned a star (Messages.lua)
+  if ns.AnnounceKill then ns.AnnounceKill(npcID, m.name or names[npcID], m.kills, seenBefore) end
 end
 
 -- A creature has died (or its death was noticed). Count it if it was yours.
@@ -179,6 +210,335 @@ end
 
 
 -- =====================================================================
+-- WHERE LOOT CAME FROM: gathering, quests
+-- =====================================================================
+-- Loot windows alone cannot say WHY you got something. Two extra signals:
+--   Gathering   UNIT_SPELLCAST_SENT tells us you cast Mining, Herb Gathering,
+--               or Skinning. Loot that opens within a few seconds is filed
+--               under that profession instead of "Objects" or "Mobs".
+--   Quests      QUEST_TURNED_IN / QUEST_LOOT_RECEIVED, plus the chat line
+--               "You receive item: ..." right after a turn-in as a backup.
+-- /lootlog kills prints what these decide.
+
+-- Escapes characters that mean something special in a Lua pattern.
+local function EscapePattern(s)
+  return (s:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0"))
+end
+
+local ctx = {
+  gather = nil,     -- { kind = "Mining", time = when you cast it, used = false }
+  questTime = 0,    -- when you last turned in a quest
+  vendor = false,   -- a vendor window is open
+  mail = false,     -- the mailbox is open
+  trade = false,    -- a trade window is open
+  questID = nil,    -- which quest you last turned in
+  questTitle = nil, -- its title, read when the reward window showed
+}
+local gatherGuid = {}    -- guid -> profession, so every part of one loot agrees
+local gatherName = {}    -- guid -> name of what you cast the profession on (for example "Copper Vein")
+local questLogged = {}   -- itemID -> when it was logged as a quest reward
+
+-- Spell IDs of the gathering professions (all ranks). If a spell is not in
+-- this list we also compare by NAME against the first rank of each.
+local GATHER_BY_ID = {
+  [2575] = "Mining",    [2576] = "Mining",    [3564] = "Mining",    [10248] = "Mining",
+  [2366] = "Herbalism", [2368] = "Herbalism", [3570] = "Herbalism", [11993] = "Herbalism",
+  [8613] = "Skinning",  [8617] = "Skinning",  [8618] = "Skinning",  [10768] = "Skinning",
+}
+local gatherByName   -- spell name -> profession, built the first time it is needed
+
+-- The name of a spell, whichever way this client provides it.
+local function SpellNameOf(id)
+  local ok, name = pcall(function()
+    if C_Spell and C_Spell.GetSpellName then return C_Spell.GetSpellName(id) end
+    if GetSpellInfo then
+      local info = GetSpellInfo(id)
+      if type(info) == "table" then return info.name end
+      return info
+    end
+  end)
+  if ok and type(name) == "string" then return name end
+end
+
+-- Which gathering profession (if any) a spell ID belongs to.
+local function GatherKind(spellID)
+  if GATHER_BY_ID[spellID] then return GATHER_BY_ID[spellID] end
+  if not gatherByName then
+    gatherByName = {}
+    for _, id in ipairs({ 2575, 2366, 8613 }) do
+      local name = SpellNameOf(id)
+      if name then gatherByName[name] = GATHER_BY_ID[id] end
+    end
+  end
+  local name = SpellNameOf(spellID)
+  return name and gatherByName[name] or nil
+end
+
+-- The log category for loot from one source (a corpse or an object).
+--   fishing  -> "Fishing"
+--   a profession you just used -> "Mining" / "Herbalism" / "Skinning"
+--   otherwise -> "Mobs", "Objects" (chests and so on), or "Other"
+local function CategoryFor(guid, kind, fishing)
+  if fishing then return "Fishing" end
+  local known = gatherGuid[guid]
+  if known then return known end
+  local g = ctx.gather
+  if g and not g.used and (GetTime() - g.time) < 10 then
+    -- Mining and herbs open an object (a node); skinning opens a corpse.
+    local fits = (g.kind == "Skinning" and kind == "Creature")
+              or (g.kind ~= "Skinning" and kind == "GameObject")
+    if fits then
+      gatherGuid[guid] = g.kind
+      gatherName[guid] = g.target
+      g.used = true
+      kdebug("gathering:", g.kind, guid)
+      return g.kind
+    end
+  end
+  return (kind == "Creature" and "Mobs") or (kind == "GameObject" and "Objects") or "Other"
+end
+
+-- Gathering is also logged per NODE: which vein, herb, skinned creature, or
+-- chest the loot came from. db.gather[category][zone][nodeKey] =
+--   { id = object or creature ID, kind, gathers = times, items = { [itemID] = qty } }
+-- nodeKey is "o<objectID>" for objects and "c<npcID>" for creatures (skinning).
+-- Names are saved in db.nodeNames[nodeKey]: the game tells us the name of what
+-- a profession was cast on, which we remember against the node's ID.
+local GATHER_NODE_CATEGORIES = { Mining = true, Herbalism = true, Skinning = true, Objects = true }
+
+-- Finds (or creates) the record for the node this loot came from and counts
+-- the gather once. Returns the record, or nil for loot that is not gathering.
+local function NoteNode(guid, kind, id, category, zone)
+  if not GATHER_NODE_CATEGORIES[category] then return nil end
+  local objectID = tonumber(id)
+  if not objectID then return nil end
+  local db = ns.DB()
+  local key = (kind == "Creature" and "c" or "o") .. objectID
+
+  -- The name: what you cast the profession on, or a known creature name
+  local name = gatherName[guid] or (kind == "Creature" and names[objectID]) or nil
+  if name then
+    db.nodeNames = db.nodeNames or {}
+    db.nodeNames[key] = name
+  end
+
+  db.gather = db.gather or {}
+  local byZone = db.gather[category]
+  if not byZone then byZone = {}; db.gather[category] = byZone end
+  local nodes = byZone[zone]
+  if not nodes then nodes = {}; byZone[zone] = nodes end
+  local n = nodes[key]
+  if not n then n = { id = objectID, kind = kind, gathers = 0, items = {} }; nodes[key] = n end
+
+  if not counted[guid .. ":node"] then   -- LOOT_OPENED and LOOT_READY both fire: count once
+    counted[guid .. ":node"] = true
+    n.gathers = n.gathers + 1
+  end
+  return n
+end
+
+-- Where a drop came from, in words, for the rare-drop message.
+local function SourceText(category, id, guid)
+  local npcID = tonumber(id)
+  if category == "Mobs" or category == "Skinning" then
+    local m = ns.DB().mobs[npcID]
+    return names[npcID] or (m and m.name) or "a creature"
+  elseif category == "Fishing" then
+    return "the water"
+  elseif category == "Mining" or category == "Herbalism" then
+    return gatherName[guid] or "a node"
+  elseif category == "Objects" then
+    return "a container"
+  end
+  return "somewhere"
+end
+
+-- Adds coin (in copper) to the totals, by source and zone.
+local function AddGold(category, zone, coin)
+  ns.session.coin = ns.session.coin + coin   -- session total
+  local db = ns.DB()
+  db.gold = db.gold or {}
+  db.gold.total = (db.gold.total or 0) + coin
+  db.gold.drops = (db.gold.drops or 0) + 1
+  db.gold.events = db.gold.events or {}
+  local byZone = db.gold.events[category]
+  if not byZone then byZone = {}; db.gold.events[category] = byZone end
+  byZone[zone] = (byZone[zone] or 0) + coin
+end
+
+-- Adds an item to the event log (category -> zone -> item), the same place
+-- loot-window items go. Used for items that never open a loot window.
+local function LogEvent(category, itemID, qty, link, zone)
+  local db = ns.DB()
+  db.items = db.items or {}
+  if link then db.items[itemID] = link end
+  local z = db.events[category]; if not z then z = {}; db.events[category] = z end
+  local zz = z[zone]; if not zz then zz = {}; z[zone] = zz end
+  local e = zz[itemID] or { name = link and link:match("%[(.-)%]") or nil, count = 0 }
+  e.count = e.count + (qty or 1)
+  e.quality = e.quality or ns.ItemQuality(db, itemID)   -- read from the item link (Core.lua)
+  zz[itemID] = e
+end
+
+-- Turns a game message format such as "You receive item: %s." into a pattern
+-- that captures the item link (the game's own wording, so other languages work).
+local function FormatToPattern(fmt)
+  local p = EscapePattern(fmt)
+  p = p:gsub("%%%%s", "(.+)")     -- the item link
+  p = p:gsub("%%%%d", "(%%d+)")   -- a quantity
+  return "^" .. p .. "$"
+end
+local RECEIVE_MULTI  = LOOT_ITEM_PUSHED_SELF_MULTIPLE and FormatToPattern(LOOT_ITEM_PUSHED_SELF_MULTIPLE)
+local RECEIVE_SINGLE = LOOT_ITEM_PUSHED_SELF and FormatToPattern(LOOT_ITEM_PUSHED_SELF)
+local CREATE_MULTI   = LOOT_ITEM_CREATED_SELF_MULTIPLE and FormatToPattern(LOOT_ITEM_CREATED_SELF_MULTIPLE)
+local CREATE_SINGLE  = LOOT_ITEM_CREATED_SELF and FormatToPattern(LOOT_ITEM_CREATED_SELF)
+
+-- Reads one of your own item messages:
+--   "You receive item: [Link]x3."   (a quest reward, a purchase, mail, a trade...)
+--   "You create: [Link]."           (something you crafted)
+-- Returns itemID, quantity, link, kind ("received" or "created"), or nil.
+-- Items from a loot window say "You receive loot:" instead and are NOT read
+-- here, because the loot window code already logs them.
+local function ParseReceived(text)
+  if type(text) ~= "string" or issecret(text) then return nil end
+  local link, qty, kind
+  if CREATE_MULTI then link, qty = text:match(CREATE_MULTI) end
+  if not link and CREATE_SINGLE then link = text:match(CREATE_SINGLE) end
+  if link then
+    kind = "created"
+  else
+    if RECEIVE_MULTI then link, qty = text:match(RECEIVE_MULTI) end
+    if not link and RECEIVE_SINGLE then link = text:match(RECEIVE_SINGLE) end
+    kind = "received"
+  end
+  if not link then return nil end
+  local itemID = tonumber(link:match("item:(%d+)"))
+  if not itemID then return nil end
+  return itemID, tonumber(qty) or 1, link, kind
+end
+
+-- The saved record of a quest: db.quests[questID]. Created if needed.
+local function QuestRecord(questID)
+  local db = ns.DB()
+  db.quests = db.quests or {}
+  local q = db.quests[questID]
+  if not q then q = { rewards = {} }; db.quests[questID] = q end
+  q.rewards = q.rewards or {}
+  return q
+end
+
+-- Records a quest reward item. Two signals can report the same item, so an
+-- item logged in the last 5 seconds is not logged again. questID may be nil
+-- (the chat backup), in which case the quest you last turned in is used.
+local function LogQuestReward(itemID, qty, link, how, questID)
+  local now = GetTime()
+  if questLogged[itemID] and now - questLogged[itemID] < 5 then return end
+  questLogged[itemID] = now
+  LogEvent("Quest", itemID, qty, link, GetRealZoneText() or "Unknown")
+  -- Also list it under the quest itself (Completed Quests tab)
+  local qid = questID
+  if type(qid) ~= "number" or issecret(qid) then qid = ctx.questID end
+  if qid then
+    local q = QuestRecord(qid)
+    q.rewards[itemID] = (q.rewards[itemID] or 0) + (qty or 1)
+  end
+  kdebug("quest reward:", link or itemID, "x" .. tostring(qty or 1), "(" .. how .. ")")
+  if ns.RefreshIfOpen then ns.RefreshIfOpen() end
+end
+
+-- You turned in a quest. Every turn-in is logged, with or without a reward:
+-- name, date, your level, XP, coin, zone. Coin is also added to the Gold page.
+local function OnQuestTurnedIn(questID, xp, money)
+  ctx.questTime = GetTime()
+  if type(questID) ~= "number" or issecret(questID) then return end
+  ctx.questID = questID
+
+  local q = QuestRecord(questID)
+  local title
+  if C_QuestLog and C_QuestLog.GetTitleForQuestID then
+    local ok, t = pcall(C_QuestLog.GetTitleForQuestID, questID)
+    if ok and type(t) == "string" and not issecret(t) then title = t end
+  end
+  q.name = title or ctx.questTitle or q.name        -- the title read when the reward window showed is the backup
+  q.count = (q.count or 0) + 1                      -- repeatable quests count up
+  q.t = time()                                      -- when (latest turn-in)
+  q.first = q.first or q.t
+  q.level = UnitLevel("player")                     -- your level when you turned it in
+  q.zone = GetRealZoneText() or "Unknown"
+  if type(xp) == "number" and not issecret(xp) then q.xp = xp end
+  ctx.questTitle = nil
+
+  if type(money) == "number" and not issecret(money) and money > 0 then
+    q.money = money
+    AddGold("Quest", q.zone, money)
+    kdebug("quest coin:", ns.FormatMoney(money))
+  end
+  kdebug("quest turned in:", q.name or questID, "| level", tostring(q.level), "| xp", tostring(q.xp))
+  if ns.RefreshIfOpen then ns.RefreshIfOpen() end
+end
+
+-- The quest reward window opened: remember the quest's title, as a backup
+-- for when the turn-in event does not give us a name.
+local function OnQuestComplete()
+  local ok, title = pcall(GetTitleText)
+  if ok and type(title) == "string" and not issecret(title) then ctx.questTitle = title end
+end
+
+-- The game reports a quest reward item.
+local function OnQuestLoot(questID, link, qty)
+  if type(link) ~= "string" or issecret(link) then return end
+  local itemID = tonumber(link:match("item:(%d+)"))
+  if itemID then
+    LogQuestReward(itemID, (type(qty) == "number" and not issecret(qty)) and qty or 1, link, "QUEST_LOOT_RECEIVED", questID)
+  end
+end
+
+-- An item message in chat. Items that arrive WITHOUT a loot window are sorted
+-- by what you were doing:
+--   within 3 seconds of a quest turn-in       -> Quest rewards
+--   "You create: ..."                         -> Crafting
+--   mailbox open                              -> Mail
+--   vendor window open                        -> Vendor
+--   trade window open                         -> Trades
+--   anything else                             -> Other received
+-- (The Received Items page shows all but the first.)
+local function OnChatLoot(text)
+  local itemID, qty, link, kind = ParseReceived(text)
+  if not itemID then return end
+
+  -- Quest rewards also reported by QUEST_LOOT_RECEIVED: the 5 second guard
+  -- inside LogQuestReward stops them being counted twice.
+  if kind == "received" and GetTime() - ctx.questTime <= 3 then
+    LogQuestReward(itemID, qty, link, "chat")
+    return
+  end
+
+  local category
+  if kind == "created" then category = "Crafting"
+  elseif ctx.mail then category = "Mail"
+  elseif ctx.vendor then category = "Vendor"
+  elseif ctx.trade then category = "Trades"
+  else category = "Other received" end
+
+  LogEvent(category, itemID, qty, link, GetRealZoneText() or "Unknown")
+  kdebug("received:", link or itemID, "x" .. tostring(qty), "->", category)
+  if ns.RefreshIfOpen then ns.RefreshIfOpen() end
+end
+
+-- You started casting something. Remember it if it is a gathering profession.
+local function OnSpellSent(unit, target, castGUID, spellID)
+  if unit ~= "player" then return end
+  if type(spellID) ~= "number" or issecret(spellID) then return end
+  local kind = GatherKind(spellID)
+  -- target = what the spell was cast on, for example "Copper Vein" or "Peacebloom"
+  local targetName
+  if type(target) == "string" and not issecret(target) and target ~= "" then targetName = target end
+  kdebug("cast:", spellID, SpellNameOf(spellID) or "?", "on", tostring(targetName), kind and ("-> " .. kind) or "")
+  if kind then ctx.gather = { kind = kind, time = GetTime(), used = false, target = targetName } end
+end
+
+
+-- =====================================================================
 -- COIN (GOLD) CAPTURE
 -- =====================================================================
 -- A loot slot of type "money" has quantity 0; the amount is only in its text,
@@ -187,11 +547,6 @@ end
 -- like "%d Gold") are used, so this also works in other languages.
 
 local MONEY_SLOT = ns.MONEY_SLOT
-
--- Escapes characters that mean something special in a Lua pattern.
-local function EscapePattern(s)
-  return (s:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0"))
-end
 
 -- Builds a pattern from a game format string. "%d Gold" becomes "([%d,%.]+) gold"
 -- (lower case, because the slot text can differ in capital letters).
@@ -257,22 +612,14 @@ local function LogCoin(slot, amount, zone, fishing)
     if not counted[key] then              -- same guard as items: reopening a corpse must not add it twice
       counted[key] = true
       local kind, _, _, _, _, id = strsplit("-", guid)
-      local category = fishing and "Fishing"
-        or (kind == "Creature" and "Mobs")
-        or (kind == "GameObject" and "Objects") or "Other"
+      local category = CategoryFor(guid, kind, fishing)   -- Mobs / Fishing / Mining / ...
       local coin = share[i]
 
-      -- Overall totals, by source and zone
-      db.gold = db.gold or {}
-      db.gold.total = (db.gold.total or 0) + coin
-      db.gold.drops = (db.gold.drops or 0) + 1
-      db.gold.events = db.gold.events or {}
-      local byZone = db.gold.events[category]
-      if not byZone then byZone = {}; db.gold.events[category] = byZone end
-      byZone[zone] = (byZone[zone] or 0) + coin
+      AddGold(category, zone, coin)   -- overall totals, by source and zone
 
       -- Per creature: total coin and how many corpses dropped coin
-      if kind == "Creature" then
+      -- (not for skinning, which is a separate loot from the same corpse)
+      if kind == "Creature" and category == "Mobs" then
         local m = db.mobs[tonumber(id)]
         if m then
           m.gold = (m.gold or 0) + coin
@@ -304,10 +651,26 @@ pcall(f.RegisterEvent, f, "UNIT_DIED")                   -- a creature died near
 pcall(f.RegisterUnitEvent, f, "UNIT_HEALTH", "target")   -- your target's health changed (target only)
 f:RegisterEvent("PLAYER_REGEN_DISABLED")   -- you entered combat
 f:RegisterEvent("PLAYER_REGEN_ENABLED")    -- you left combat
+pcall(f.RegisterEvent, f, "PLAYER_LOGOUT")  -- you are logging out or reloading: keep this session as the "previous" one
+-- Quest rewards and gathering (see WHERE LOOT CAME FROM above)
+pcall(f.RegisterEvent, f, "QUEST_COMPLETE")            -- the quest reward window opened
+pcall(f.RegisterEvent, f, "QUEST_TURNED_IN")           -- you turned in a quest
+pcall(f.RegisterEvent, f, "QUEST_LOOT_RECEIVED")       -- a quest reward item arrived
+pcall(f.RegisterEvent, f, "CHAT_MSG_LOOT")             -- "You receive item: ..." lines
+-- Windows that tell us where an item came from (vendor, mail, trade). Any the
+-- client refuses are listed by /lootlog kills.
+ns.failedEvents = {}
+for _, ev in ipairs({ "MERCHANT_SHOW", "MERCHANT_CLOSED", "MAIL_SHOW", "MAIL_CLOSED",
+                      "TRADE_SHOW", "TRADE_CLOSED" }) do
+  if not pcall(f.RegisterEvent, f, ev) then ns.failedEvents[#ns.failedEvents + 1] = ev end
+end
+pcall(f.RegisterUnitEvent, f, "UNIT_SPELLCAST_SENT", "player")          -- you began a cast
+pcall(f.RegisterUnitEvent, f, "UNIT_SPELLCAST_INTERRUPTED", "player")   -- ...cancelled
+pcall(f.RegisterUnitEvent, f, "UNIT_SPELLCAST_FAILED", "player")        -- ...failed
 -- Both loot events can fire for the same corpse. The "seen" and "counted"
 -- tables make sure it is only logged once.
 
-f:SetScript("OnEvent", function(_, event, arg1)
+f:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
   -- Name-cache events (and the target check) do their job and stop.
   if event == "PLAYER_TARGET_CHANGED" then
     CacheName("target")
@@ -316,9 +679,27 @@ f:SetScript("OnEvent", function(_, event, arg1)
   end
   if event == "UPDATE_MOUSEOVER_UNIT" then return CacheName("mouseover") end
 
+  -- Quest and gathering events: stop after handling.
+  if event == "QUEST_COMPLETE" then return OnQuestComplete() end
+  if event == "QUEST_TURNED_IN" then return OnQuestTurnedIn(arg1, arg2, arg3) end
+  if event == "QUEST_LOOT_RECEIVED" then return OnQuestLoot(arg1, arg2, arg3) end
+  if event == "CHAT_MSG_LOOT" then return OnChatLoot(arg1) end
+  if event == "MERCHANT_SHOW" then ctx.vendor = true; return end
+  if event == "MERCHANT_CLOSED" then ctx.vendor = false; return end
+  if event == "MAIL_SHOW" then ctx.mail = true; return end
+  if event == "MAIL_CLOSED" then ctx.mail = false; return end
+  if event == "TRADE_SHOW" then ctx.trade = true; return end
+  if event == "TRADE_CLOSED" then ctx.trade = false; return end
+  if event == "UNIT_SPELLCAST_SENT" then return OnSpellSent(arg1, arg2, arg3, arg4) end
+  if event == "UNIT_SPELLCAST_INTERRUPTED" or event == "UNIT_SPELLCAST_FAILED" then
+    if ctx.gather and not ctx.gather.used then ctx.gather = nil end   -- the gather did not happen
+    return
+  end
+
   -- Kill detection events: stop after handling.
   if event == "UNIT_DIED" then return KillFor(arg1, "UNIT_DIED") end
   if event == "UNIT_HEALTH" or event == "PLAYER_REGEN_DISABLED" then return CheckTarget() end
+  if event == "PLAYER_LOGOUT" then return ns.SaveSession() end
   if event == "PLAYER_REGEN_ENABLED" then
     CheckTarget()
     PruneEngaged()
@@ -382,9 +763,9 @@ f:SetScript("OnEvent", function(_, event, arg1)
 
           -- Decide which log category this loot belongs to.
           -- Add new categories (quest, mail...) by extending this check.
-          local category = fishing and "Fishing"
-            or (kind == "Creature" and "Mobs")
-            or (kind == "GameObject" and "Objects") or "Other"
+          local category = CategoryFor(guid, kind, fishing)   -- Mobs / Fishing / Mining / ...
+          -- Gathering and chests are also logged per node (which vein, herb, or chest)
+          local node = NoteNode(guid, kind, id, category, zone)
 
           -- Duplicate guard: skip if this corpse+item was already logged.
           -- Without it, reopening a corpse you didn't empty would add the
@@ -402,10 +783,24 @@ f:SetScript("OnEvent", function(_, event, arg1)
             local e = zz[itemID] or { name = name, quality = quality, count = 0 }
             e.count = e.count + amount
             zz[itemID] = e
+            if node then node.items[itemID] = (node.items[itemID] or 0) + amount end   -- items per node
+            -- A chat message if this catch earned a star (Messages.lua)
+            if category == "Fishing" and ns.AnnounceFish then ns.AnnounceFish(itemID, amount) end
+            -- Session totals (the Session page)
+            local sess = ns.session
+            local q = quality or 1
+            sess.items = sess.items + amount
+            sess.itemQty[itemID] = (sess.itemQty[itemID] or 0) + amount
+            sess.byQuality[q] = (sess.byQuality[q] or 0) + amount
+            -- A chat message for blue and better drops (Messages.lua)
+            if q >= 3 and ns.AnnounceDrop then
+              ns.AnnounceDrop(link, q, SourceText(category, id, guid))
+            end
           end
 
-          -- Per-mob stats: only for creatures. Used by the Mob Drops page.
-          if kind == "Creature" then
+          -- Per-mob stats: only for creatures we killed (not skinning, which is
+          -- a separate loot from the same corpse). Used by the Mob Drops page.
+          if kind == "Creature" and category == "Mobs" then
             local npcID = tonumber(id)
             local m = db.mobs[npcID] or { name = names[npcID], kills = 0, items = {} }
             m.name = m.name or names[npcID]

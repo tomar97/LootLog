@@ -25,14 +25,17 @@
  (Seed_*.lua) and from what the game reports when you meet a creature.
 
  STARS (kill counts come from ns.HUNT_TIERS_BY_CLASS in Core.lua):
-   Normal / Quest   10 / 50 / 100 kills
+   Normal           10 / 50 / 100 kills
+   Quest            ONE star in total, earned on the first kill
    Elite/Rare/Boss  1 / 5 / 10 kills
    Critter          1 star for SEEING it, 2 for killing one, 3 for killing 5
 
  CONTROLS (top bar of the list view):
    Zone       drop-down: Current zone (follows you), All zones, or a zone
    Type       drop-down: Creatures / Critters / All types
-   Show       drop-down: All / Seen / Unseen / Not in version
+   Show       drop-down: All / Seen / Unseen / Killed / Not killed / Not in version
+   Sort       drop-down: Name / Most kills / Killed first / Not killed first / Most recent kill
+   (the zone button also shows "killed / creatures" for what is listed)
    Prev / Next   page through the grid
 
  SEEN vs UNSEEN:
@@ -88,8 +91,19 @@ local SEEN_CHOICES = {
   { key = "all",    label = "All" },
   { key = "seen",   label = "Seen" },
   { key = "unseen", label = "Unseen" },
+  { key = "killed",    label = "Killed" },
+  { key = "notkilled", label = "Not killed", short = "Unkilled" },
   -- creatures you marked "Not in game version" (hidden from every other list)
   { key = "removed", label = "Not in version", short = "Removed" },
+}
+
+-- Choices for the Sort drop-down
+local SORT_CHOICES = {
+  { key = "name",     label = "Name (A to Z)",     short = "Name" },
+  { key = "kills",    label = "Most kills",        short = "Kills" },
+  { key = "killed",   label = "Killed first",      short = "Killed" },
+  { key = "unkilled", label = "Not killed first",  short = "Unkilled" },
+  { key = "recent",   label = "Most recent kill",  short = "Recent" },
 }
 
 -- Finds the label for a key in a choices list (used for the button text)
@@ -144,34 +158,40 @@ end
 -- How many stars a kill count has earned (0 to 3) for a creature class.
 -- seen = true if you have met the creature (critters earn a star for that).
 local function StarsFor(kills, class, seen)
-  local n = 0
-  if class == "critter" and seen then n = 1 end   -- first critter star = seeing it
-  for _, tier in ipairs(ns.TiersFor(class)) do
-    if kills >= tier then n = n + 1 end
-  end
-  return n
+  return ns.StarsFor(kills, class, seen)   -- shared with the chat messages (Core.lua)
 end
 
 -- Text telling you how to earn the next star, or nil if all are earned.
 local function NextStarText(kills, class, seen)
   if class == "critter" and not seen then return "See it for its first star" end
   for _, tier in ipairs(ns.TiersFor(class)) do
-    if kills < tier then return "Next star at " .. tier .. " kills" end
+    if kills < tier then
+      if tier == 1 then return "Kill it for its next star" end
+      return "Next star at " .. tier .. " kills"
+    end
   end
   return nil
 end
 
 -- Lights up (or dims) a row of three star textures to match a star count.
-local function SetStars(textures, count)
+-- maxStars is how many are possible for the creature's class (ns.MaxStars). When
+-- only one is possible (quest creatures) just the middle star is shown, so it
+-- sits in the centre.
+local function SetStars(textures, count, maxStars)
+  local function light(t, on)
+    t:SetDesaturated(not on)
+    t:SetAlpha(on and 1 or 0.3)
+  end
+  if maxStars == 1 then
+    textures[1]:Hide()
+    textures[3]:Hide()
+    textures[2]:Show()
+    light(textures[2], count >= 1)
+    return
+  end
   for s = 1, 3 do
-    local t = textures[s]
-    if s <= count then
-      t:SetDesaturated(false)
-      t:SetAlpha(1)
-    else
-      t:SetDesaturated(true)
-      t:SetAlpha(0.3)
-    end
+    textures[s]:Show()
+    light(textures[s], s <= count)
   end
 end
 
@@ -267,7 +287,7 @@ local function FillCard(card, e)
     end
   end
 
-  SetStars(card.stars, StarsFor(e.kills, e.class, e.seen))
+  SetStars(card.stars, StarsFor(e.kills, e.class, e.seen), ns.MaxStars(e.class))
 end
 
 
@@ -306,6 +326,7 @@ local function BuildEntries(db, s)
     r.seen = true
     r.name = k.name or r.name
     r.crit = r.crit or ns.IsCritterType(k.ctype)
+    r.ctype = r.ctype or k.ctype   -- what the game told us (the starter list is only a fallback)
     for z in pairs(k.zones or {}) do      -- copy, don't alias the saved table
       r.zones[z] = true
       visited[z] = true
@@ -345,6 +366,7 @@ local function BuildEntries(db, s)
       local r = rec(c.id)
       r.name = r.name or c.name
       r.crit = r.crit or ns.IsCritterType(c.ctype)
+      r.ctype = r.ctype or c.ctype
       for _, z in ipairs(hit) do r.zones[z] = true end
       r.fac = r.fac or {}
       for letter in c.fac:gmatch(".") do   -- "AH" sets both
@@ -389,6 +411,8 @@ local function BuildEntries(db, s)
     local isCritter = (class == "critter")
     local viewOK = (s.huntView == "all") or (wantCritters == isCritter)
     local zoneOK = ZoneMatches(r, s.huntZone, places)
+    local mm = db.mobs[id]
+    local killsNow = mm and mm.kills or 0   -- for the Killed / Not killed filters
     local gone = ns.IsNotInGame(db, id)   -- marked "not in game version"
     local seenOK
     if s.huntSeen == "removed" then
@@ -396,7 +420,9 @@ local function BuildEntries(db, s)
     else
       seenOK = (not gone) and ((s.huntSeen == "all")
                    or (s.huntSeen == "seen" and r.seen)
-                   or (s.huntSeen == "unseen" and not r.seen))
+                   or (s.huntSeen == "unseen" and not r.seen)
+                   or (s.huntSeen == "killed" and killsNow > 0)
+                   or (s.huntSeen == "notkilled" and killsNow == 0))
     end
     if viewOK and zoneOK and seenOK then
       local m = db.mobs[id]
@@ -406,8 +432,10 @@ local function BuildEntries(db, s)
         id = id,
         name = r.name or ("ID " .. id),
         kills = kills,
+        last = (m and m.lastKill) or 0,   -- time of the latest kill (0 = none recorded)
         class = class,
         crit = r.crit,
+        ctype = r.ctype,
         where = ZonesText(r.zones),
         seen = r.seen,
         host = r.host,
@@ -415,7 +443,22 @@ local function BuildEntries(db, s)
       }
     end
   end
+  -- Order set by the Sort drop-down; ties always fall back to name, then ID
+  local sortKey = s.huntSort or "name"
   table.sort(entries, function(a, b)
+    if sortKey == "kills" then
+      if a.kills ~= b.kills then return a.kills > b.kills end
+    elseif sortKey == "killed" then
+      if (a.kills > 0) ~= (b.kills > 0) then return a.kills > 0 end
+    elseif sortKey == "unkilled" then
+      if (a.kills > 0) ~= (b.kills > 0) then return a.kills == 0 end
+    elseif sortKey == "recent" then
+      -- latest kill first; killed creatures with no recorded time come next,
+      -- creatures never killed last
+      local ta = (a.kills > 0) and a.last or -1
+      local tb = (b.kills > 0) and b.last or -1
+      if ta ~= tb then return ta > tb end
+    end
     if a.name ~= b.name then return a.name < b.name end
     return a.id < b.id
   end)
@@ -430,8 +473,10 @@ end
 -- Prints what the Hunting Log has loaded and how many creatures it would
 -- list, to find out why a list is empty.
 function ns.HuntDebug()
-  local db = ns.DB()
+  local db = ns.ViewDB()
   local s = ns.Settings()
+  print(string.format("LootLog debug: data for %s | characters with data: %d | viewing: %s",
+    ns.CharKey(), #ns.CharList(), s.allChars and "all characters" or "this character"))
   local seed = ns.SeedCreatures and #ns.SeedCreatures or 0
   local zones = 0
   for _ in pairs(ns.ZONE_NAME or {}) do zones = zones + 1 end
@@ -446,6 +491,7 @@ function ns.HuntDebug()
     print("  -> The zone list did not load. Check ZoneData.lua is in the LootLog folder AND listed in LootLog.toc.")
   end
   print(string.format("  your settings: zone=%s  type=%s  show=%s", s.huntZone, s.huntView, s.huntSeen))
+  print("  creature tooltip line: " .. (ns.tooltipHooked and "hooked" or "NOT hooked (the game's tooltip hook was not available)"))
   local gone = 0
   for _ in pairs(db.notInGame or {}) do gone = gone + 1 end
   if gone > 0 then print(string.format("  %d creatures are marked 'not in game version' (Show > Not in version).", gone)) end
@@ -501,16 +547,15 @@ local function GetDetailRow(i)
   r.qty  = fs(364, 50)
   r.rate = fs(420, 200)
   r:SetScript("OnEnter", function(self)
-    if self.link then
-      -- an item row: show the item tooltip
+    if self.link or self.tipLines then
       GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-      GameTooltip:SetHyperlink(self.link)
-      GameTooltip:Show()
-    elseif self.tipLines then
-      -- the coin row: show the lines built by ns.CoinTipLines (title first)
-      GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-      for i, line in ipairs(self.tipLines) do
-        if i == 1 then GameTooltip:AddLine(line) else GameTooltip:AddLine(line, 1, 1, 1) end
+      if self.link then
+        GameTooltip:SetHyperlink(self.link)   -- an item row: the item tooltip
+      else
+        -- the coin row: the lines built by ns.CoinTipLines (title first)
+        for i, line in ipairs(self.tipLines) do
+          if i == 1 then GameTooltip:AddLine(line) else GameTooltip:AddLine(line, 1, 1, 1) end
+        end
       end
       GameTooltip:Show()
     end
@@ -543,6 +588,7 @@ local function RefreshDetail(db)
   -- Info block to the right of the model.
   -- (A creature description will go here later.)
   local lines = { "ID " .. e.id }
+  if e.ctype and e.ctype ~= "Uncategorized" then lines[#lines + 1] = "Type: " .. e.ctype end
   if class ~= "normal" then lines[#lines + 1] = ns.CLASS_LABELS[class] end
   if not seen then lines[#lines + 1] = "Not met yet (starter list)" end
   if ns.IsNotInGame(db, e.id) then lines[#lines + 1] = "Marked: not in game version" end
@@ -552,10 +598,14 @@ local function RefreshDetail(db)
   end
   if e.where then lines[#lines + 1] = "Zones: " .. e.where end
   lines[#lines + 1] = (kills > 0) and ("Kills: " .. kills) or "Not killed yet"
+  if m and m.firstKill then
+    lines[#lines + 1] = "First kill: " .. ns.DateTimeText(m.firstKill) ..
+                        "     Last kill: " .. ns.DateTimeText(m.lastKill or m.firstKill)
+  end
   lines[#lines + 1] = NextStarText(kills, class, seen) or "All stars earned"
   ui.huntDetailInfo:SetText(table.concat(lines, "\n"))
 
-  SetStars(ui.huntDetailStars, StarsFor(kills, class, seen))
+  SetStars(ui.huntDetailStars, StarsFor(kills, class, seen), ns.MaxStars(class))
 
   -- Loot list. Row 1 is the coin row (gold coin picture) when this creature
   -- has dropped any coin; the items follow it.
@@ -572,7 +622,7 @@ local function RefreshDetail(db)
     r.name:SetText("Coin  " .. ns.FormatMoney(m.gold))
     r.id:SetText("-")
     r.qty:SetText("")
-    r.rate:SetText(string.format("%d/%d (%.1f%%)", coinDrops, killsForRate, 100 * coinDrops / killsForRate))
+    r.rate:SetText(ns.RateText(coinDrops, kills))
     r:Show()
   end
   for i, d in ipairs(drops) do
@@ -584,7 +634,7 @@ local function RefreshDetail(db)
     r.name:SetText(link or ("item:" .. d.id))
     r.id:SetText(d.id)
     r.qty:SetText("x" .. d.it.qty)
-    r.rate:SetText(string.format("%d/%d (%.1f%%)", d.it.drops, killsForRate, 100 * d.it.drops / killsForRate))
+    r.rate:SetText(ns.RateText(d.it.drops, kills))
     r:Show()
   end
   for i = #drops + first + 1, #detailRows do detailRows[i]:Hide() end
@@ -618,7 +668,8 @@ function ns.RefreshHunt(db)
   -- faction's log (ns.Refresh in UI.lua resets the title for other pages).
   if ui.TitleText and s.huntFaction ~= "mine" then
     local names = { A = "Alliance", H = "Horde", all = "all factions" }
-    ui.TitleText:SetText("LootLog - viewing " .. (names[s.huntFaction] or "?") .. " log")
+    ui.TitleText:SetText("LootLog - viewing " .. (names[s.huntFaction] or "?") .. " log" ..
+                         (s.allChars and " (all characters)" or ""))
   end
 
   -- Pagination: keep the page number inside the valid range
@@ -642,14 +693,15 @@ function ns.RefreshHunt(db)
   if s.huntZone == "All" then
     zoneText = "All zones"
   elseif s.huntZone == CURRENT then
-    zoneText = "Current (" .. CurrentZoneLabel() .. ")"
+    zoneText = "Here: " .. CurrentZoneLabel()
   else
     zoneText = s.huntZone
   end
-  ui.huntZoneBtn:SetText(Shorten("Zone: " .. zoneText, 26))
+  -- The zone button also carries the count: killed / creatures shown
+  ui.huntZoneBtn:SetText(Shorten(zoneText, 20) .. string.format("  %d/%d", killed, #entries))
   ui.huntViewBtn:SetText(LabelFor(VIEW_CHOICES, s.huntView))
   ui.huntSeenBtn:SetText("Show: " .. LabelFor(SEEN_CHOICES, s.huntSeen))
-  ui.huntSummary:SetText(string.format("Killed %d / %d", killed, #entries))
+  ui.huntSortBtn:SetText("Sort: " .. LabelFor(SORT_CHOICES, s.huntSort))
   ui.huntPageText:SetText(string.format("Page %d / %d", ns.huntPage, pages))
   ui.huntPrev:SetEnabled(ns.huntPage > 1)
   ui.huntNext:SetEnabled(ns.huntPage < pages)
@@ -837,7 +889,7 @@ local function ShowChoiceMenu(anchor, choices, current, onPick)
       choiceRows[i] = b
     end
     b.key = c.key
-    b.text:SetText(c.label)
+    b.text:SetText((c.key == current and "> " or "") .. c.label)   -- ">" marks the current choice
     if c.key == current then b.text:SetTextColor(1, 0.82, 0) else b.text:SetTextColor(1, 1, 1) end
     b:Show()
   end
@@ -847,6 +899,10 @@ local function ShowChoiceMenu(anchor, choices, current, onPick)
   choiceMenu:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -2)   -- opens under the button
   choiceMenu:Show()
 end
+
+-- Shared with other pages (the Fishing Log uses the same drop-down)
+ns.ShowChoiceMenu = ShowChoiceMenu
+ns.CloseMenus = CloseMenus
 
 
 -- =====================================================================
@@ -943,6 +999,9 @@ local function CreateCard(parent, index)
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
     GameTooltip:AddLine(e.name)
     GameTooltip:AddLine("ID " .. e.id, 0.7, 0.7, 0.7)
+    if e.ctype and e.ctype ~= "Uncategorized" then
+      GameTooltip:AddLine("Type: " .. e.ctype, 0.7, 0.7, 0.7)   -- Beast, Humanoid, Undead...
+    end
     if e.class ~= "normal" then
       local c = CLASS_COLORS[e.class] or { 1, 1, 1 }
       GameTooltip:AddLine(ns.CLASS_LABELS[e.class], c[1], c[2], c[3])
@@ -962,6 +1021,9 @@ local function CreateCard(parent, index)
     end
     if e.kills > 0 then
       GameTooltip:AddLine("Kills: " .. e.kills, 1, 1, 1)
+      if e.last and e.last > 0 then
+        GameTooltip:AddLine("Last kill: " .. ns.DateTimeText(e.last), 0.7, 0.7, 0.7)
+      end
     else
       GameTooltip:AddLine("Not killed yet", 1, 0.3, 0.3)
     end
@@ -998,7 +1060,7 @@ function ns.CreateHuntPanel(ui)
   list:SetAllPoints()
   ui.huntList = list
 
-  -- ---- Top bar, left side: zone, type, show, summary ----
+  -- ---- Top bar, left side: zone (with the count), type, show, sort ----
   -- Zone drop-down
   ui.huntZoneBtn = CreateFrame("Button", nil, list, "UIPanelButtonTemplate")
   ui.huntZoneBtn:SetSize(180, 22)
@@ -1036,8 +1098,17 @@ function ns.CreateHuntPanel(ui)
     end)
   end)
 
-  ui.huntSummary = list:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  ui.huntSummary:SetPoint("TOPLEFT", 388, -8)
+  -- Sort drop-down (Name / Most kills / Killed first / Not killed first)
+  ui.huntSortBtn = CreateFrame("Button", nil, list, "UIPanelButtonTemplate")
+  ui.huntSortBtn:SetSize(96, 22)
+  ui.huntSortBtn:SetPoint("TOPLEFT", 386, -2)
+  ui.huntSortBtn:SetScript("OnClick", function(self)
+    ShowChoiceMenu(self, SORT_CHOICES, ns.Settings().huntSort, function(key)
+      ns.Settings().huntSort = key
+      ns.huntPage = 1
+      ns.Refresh()
+    end)
+  end)
 
   -- ---- Top bar, right side: paging controls ----
   ui.huntNext = CreateFrame("Button", nil, list, "UIPanelButtonTemplate")

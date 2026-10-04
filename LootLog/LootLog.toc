@@ -12,3 +12,9 @@ ZoneData.lua
 Seed_A_Hostile.lua
 Seed_H_Neutral.lua
 Seed_H_Hostile.lua
+FishData.lua
+PageFishing.lua
+Seed_Zephras_Isle.lua
+ClassData.lua
+Messages.lua
+Tooltips.lua

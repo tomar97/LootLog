@@ -1618,6 +1618,7 @@ local ZONES = {
   {3956,"The Shadow Stair"},
   {3957,"Sha'tari Outpost"},
   {3958,"Sha'tari Base Camp"},
+  {16593,"Zephras Isle"},   -- new zone; ID as you gave it (the map ID in game is 2521)
 }
 
 ns.ZONE_NAME, ns.ZONE_IDS, ns.ZONE_UNUSED = {}, {}, {}

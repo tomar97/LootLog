@@ -23,6 +23,22 @@
 
 local ADDON, ns = ...
 
+-- The question asked before deleting a creature's data (right-click it in the
+-- list). %s is replaced with the creature's name.
+StaticPopupDialogs["LOOTLOG_DELETE_MOB"] = {
+  text = "Delete the LootLog data for %s on THIS character?\n\nThis removes its kills (and Hunting Log stars), drops and coin. Other characters keep theirs. It cannot be undone.",
+  button1 = "Delete",
+  button2 = "Cancel",
+  OnAccept = function(self, data)
+    local npcID = data or self.data
+    if npcID then ns.DeleteMob(npcID) end
+  end,
+  timeout = 0,
+  whileDead = true,
+  hideOnEscape = true,
+  preferredIndex = 3,
+}
+
 local mobRows, dropRows = {}, {}   -- pools of reusable row frames
 
 -- Sort buttons shown at the top of the page. To add a sort:
@@ -32,6 +48,7 @@ local SORTS = {
   { key = "name",  label = "Name" },
   { key = "kills", label = "Kills" },
   { key = "zone",  label = "Zone" },
+  { key = "recent", label = "Recent" },   -- the creature you killed most recently first
 }
 
 
@@ -55,6 +72,10 @@ local function SortedMobs(db, sortKey)
       if a.m.kills ~= b.m.kills then return a.m.kills > b.m.kills end   -- most kills first
     elseif sortKey == "zone" then
       if a.zone ~= b.zone then return a.zone < b.zone end
+    elseif sortKey == "recent" then
+      -- latest kill first; creatures with no recorded kill time go last
+      local ta, tb = a.m.lastKill or 0, b.m.lastKill or 0
+      if ta ~= tb then return ta > tb end
     end
     if a.name ~= b.name then return a.name < b.name end
     return a.id < b.id
@@ -62,12 +83,73 @@ local function SortedMobs(db, sortKey)
   return list
 end
 
--- Returns one mob's drops as a list of { id, it }, most common first.
-local function SortedDrops(m)
+-- Keeps only the mobs that match the search text (already lower case): the
+-- mob's name, its ID, its zone, or the name of any item it dropped. When a
+-- rarity is chosen, also keeps only mobs that dropped an item of that rarity.
+-- No search and rarity "all" keeps everything.
+local function FilterMobs(db, mobs, text, rarity)
+  if text == "" and rarity == "all" then return mobs end
+  local out = {}
+  for _, e in ipairs(mobs) do
+    local hit = true
+    if text ~= "" then
+      hit = (e.m.name or ""):lower():find(text, 1, true)
+            or tostring(e.id) == text
+            or e.zone:lower():find(text, 1, true)
+      if not hit then
+        for itemID in pairs(e.m.items) do
+          local link = db.items and db.items[itemID]
+          local itemName = link and link:match("%[(.-)%]")   -- the name between the brackets of the link
+          if itemName and itemName:lower():find(text, 1, true) then hit = true; break end
+        end
+      end
+    end
+    if hit and rarity ~= "all" then
+      hit = false
+      for itemID in pairs(e.m.items) do
+        if ns.RarityMatches(rarity, ns.ItemQuality(db, itemID)) then hit = true; break end
+      end
+    end
+    if hit then out[#out + 1] = e end
+  end
+  return out
+end
+
+-- What to say when the list is empty.
+local function EmptyMessage()
+  local filtered = (ns.mobSearch or "") ~= "" or ns.Settings().rarity ~= "all"
+  return filtered and "No creatures match your search or filter." or "No mob drops recorded yet."
+end
+
+-- Returns one mob's drops as a list of { id, it, name }, in the order chosen
+-- by clicking the table headings (s.dropSort / s.dropDesc), and only the
+-- items that fit the rarity filter (s.rarity).
+local function SortedDrops(db, m)
+  local s = ns.Settings()
+  local key, desc = s.dropSort, s.dropDesc
   local drops = {}
-  for itemID, it in pairs(m.items) do drops[#drops + 1] = { id = itemID, it = it } end
+  for itemID, it in pairs(m.items) do
+    if ns.RarityMatches(s.rarity, ns.ItemQuality(db, itemID)) then
+      local link = db.items and db.items[itemID]
+      local name = ((link and link:match("%[(.-)%]")) or ""):lower()   -- item name, for sorting by name
+      drops[#drops + 1] = { id = itemID, it = it, name = name }
+    end
+  end
+  -- The value each heading sorts by. "rate" is drops / kills, which orders
+  -- the same as the number of drops because kills are the same for every item.
+  local function value(d)
+    if key == "name" then return d.name end
+    if key == "id" then return d.id end
+    if key == "qty" then return d.it.qty end
+    return d.it.drops
+  end
   table.sort(drops, function(a, b)
-    if a.it.drops ~= b.it.drops then return a.it.drops > b.it.drops end
+    local va, vb = value(a), value(b)
+    if va ~= vb then
+      if desc then return va > vb end
+      return va < vb
+    end
+    if a.it.drops ~= b.it.drops then return a.it.drops > b.it.drops end   -- ties: most common first
     return a.id < b.id
   end)
   return drops
@@ -120,11 +202,30 @@ local function GetMobRow(i)
   b.text:SetWidth(154)
   b.text:SetJustifyH("LEFT")
   b.text:SetWordWrap(false)
-  b:SetScript("OnClick", function(self)
+  b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+  b:SetScript("OnClick", function(self, button)
     if not self.npcID then return end   -- zone headings have no npcID: ignore clicks
-    ns.selectedMob = self.npcID         -- npcID is set in RefreshMobs
-    ns.Refresh()
+    if button == "RightButton" then
+      if ns.Settings().allChars then
+        -- the combined view is made from several characters, so there is nothing single to delete
+        print("LootLog: untick 'All characters' to delete a creature's data for the character you are playing.")
+        return
+      end
+      -- ask first; the question is defined at the top of this file
+      StaticPopup_Show("LOOTLOG_DELETE_MOB", self.mobName or tostring(self.npcID), nil, self.npcID)
+    else
+      ns.selectedMob = self.npcID       -- npcID is set in RefreshMobs
+      ns.Refresh()
+    end
   end)
+  b:SetScript("OnEnter", function(self)
+    if not self.npcID then return end
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:AddLine(self.mobName or "")
+    GameTooltip:AddLine("Right-click to delete this creature's data", 0.6, 0.6, 0.6)
+    GameTooltip:Show()
+  end)
+  b:SetScript("OnLeave", function() GameTooltip:Hide() end)
   mobRows[i] = b
   return b
 end
@@ -157,16 +258,15 @@ local function GetDropRow(i)
   r.qty  = fs(276, 40)
   r.rate = fs(320, 140)
   r:SetScript("OnEnter", function(self)
-    if self.link then
-      -- an item row: show the item tooltip
+    if self.link or self.tipLines then
       GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-      GameTooltip:SetHyperlink(self.link)
-      GameTooltip:Show()
-    elseif self.tipLines then
-      -- the coin row: show the lines built by ns.CoinTipLines (title first)
-      GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-      for i, line in ipairs(self.tipLines) do
-        if i == 1 then GameTooltip:AddLine(line) else GameTooltip:AddLine(line, 1, 1, 1) end
+      if self.link then
+        GameTooltip:SetHyperlink(self.link)   -- an item row: the item tooltip
+      else
+        -- the coin row: the lines built by ns.CoinTipLines (title first)
+        for i, line in ipairs(self.tipLines) do
+          if i == 1 then GameTooltip:AddLine(line) else GameTooltip:AddLine(line, 1, 1, 1) end
+        end
       end
       GameTooltip:Show()
     end
@@ -186,7 +286,10 @@ end
 local function RenderExpanded(db, mobs, sortKey)
   local ui = ns.ui
   local lines = {}
-  if #mobs == 0 then lines[1] = "No mob drops recorded yet." end
+  local s = ns.Settings()
+  if #mobs == 0 then
+    lines[1] = EmptyMessage()
+  end
   local lastZone
   for _, e in ipairs(mobs) do
     local m = e.m
@@ -196,17 +299,20 @@ local function RenderExpanded(db, mobs, sortKey)
       lastZone = e.zone
     end
     local kills = math.max(m.kills, 1)   -- avoid dividing by zero
-    lines[#lines + 1] = string.format("|cffffd100%s|r (ID %d) - kills: %d - %s",
-      m.name or "Unknown", e.id, m.kills, ZoneText(m))
+    local lastText = m.lastKill and (" - last kill " .. ns.DateTimeText(m.lastKill)) or ""
+    lines[#lines + 1] = string.format("|cffffd100%s|r (ID %d) - kills: %d%s - %s",
+      m.name or "Unknown", e.id, m.kills, lastText, ZoneText(m))
     -- Coin line (with the gold coin picture) before the items
-    if m.gold and m.gold > 0 then
+    if m.gold and m.gold > 0 and s.rarity == "all" then   -- coin has no rarity, so it is hidden when filtering
       local cd = m.goldDrops or 0
-      lines[#lines + 1] = string.format("    |T%s:14|t Coin  %s   %d/%d (%.1f%%)",
-        ns.COIN_ICON, ns.FormatMoney(m.gold), cd, kills, 100 * cd / kills)
+      local rate = ns.RateText(cd, m.kills)
+      lines[#lines + 1] = string.format("    |T%s:14|t Coin  %s   %s",
+        ns.COIN_ICON, ns.FormatMoney(m.gold), rate)
     end
-    for _, d in ipairs(SortedDrops(m)) do
-      lines[#lines + 1] = string.format("    %s [ID %d] x%d   %d/%d (%.1f%%)",
-        ns.ItemText(db, d.id), d.id, d.it.qty, d.it.drops, kills, 100 * d.it.drops / kills)
+    for _, d in ipairs(SortedDrops(db, m)) do
+      local rate = ns.RateText(d.it.drops, m.kills)
+      lines[#lines + 1] = string.format("    %s [ID %d] x%d   %s",
+        ns.ItemText(db, d.id), d.id, d.it.qty, rate)
     end
     lines[#lines + 1] = " "   -- blank spacer line between mobs
   end
@@ -219,6 +325,14 @@ function ns.RefreshMobs(db)
   local ui = ns.ui
   local s = ns.Settings()   -- saved choices: s.sort and s.expanded
 
+  -- Summary next to the Expanded button: totals over every creature
+  local tKills, tMobs = 0, 0
+  for _, m in pairs(db.mobs) do
+    tMobs = tMobs + 1
+    tKills = tKills + m.kills
+  end
+  ui.mobSummary:SetText(string.format("%d kills, %d creatures", tKills, tMobs))
+
   -- Update the controls: pressed look on the active sort button,
   -- and the label on the expand toggle.
   for key, b in pairs(ui.sortButtons) do
@@ -226,11 +340,27 @@ function ns.RefreshMobs(db)
   end
   ui.expandButton:SetText(s.expanded and "Expanded: On" or "Expanded: Off")
 
+  -- Rarity button text, and the arrows on the drops table headings
+  local rarityShort = "All"
+  for _, c in ipairs(ns.RARITY_CHOICES) do
+    if c.key == s.rarity then rarityShort = c.short or c.label end
+  end
+  ui.rarityButton:SetText("Rarity: " .. rarityShort)
+  for key, hb in pairs(ui.dropHeads) do
+    if key == s.dropSort then
+      hb.text:SetText(hb.label .. (s.dropDesc and " v" or " ^"))   -- v = biggest first, ^ = smallest first
+      hb.text:SetTextColor(1, 0.82, 0)
+    else
+      hb.text:SetText(hb.label)
+      hb.text:SetTextColor(0.75, 0.75, 0.75)
+    end
+  end
+
   -- Show either the two-pane view or the expanded view, never both
   ui.split:SetShown(not s.expanded)
   ui.exp:SetShown(s.expanded)
 
-  local mobs = SortedMobs(db, s.sort)
+  local mobs = FilterMobs(db, SortedMobs(db, s.sort), ns.mobSearch or "", s.rarity)
 
   if s.expanded then
     RenderExpanded(db, mobs, s.sort)
@@ -239,8 +369,11 @@ function ns.RefreshMobs(db)
 
   -- ---- Two-pane view ----
 
-  -- Select the first mob if nothing is selected or it no longer exists
-  if not ns.selectedMob or not db.mobs[ns.selectedMob] then
+  -- Select the first mob if nothing is selected or it is not in the list
+  -- (it may have been filtered out by the search)
+  local inList = {}
+  for _, e in ipairs(mobs) do inList[e.id] = true end
+  if not ns.selectedMob or not inList[ns.selectedMob] then
     ns.selectedMob = mobs[1] and mobs[1].id or nil
   end
 
@@ -261,10 +394,12 @@ function ns.RefreshMobs(db)
     local b = GetMobRow(i)
     if e.header then
       b.npcID = nil                                   -- not clickable
+      b.mobName = nil
       b.text:SetText("|cff00ff00" .. e.header .. "|r")
       b.sel:Hide()
     else
       b.npcID = e.id
+      b.mobName = e.m.name or ("ID " .. e.id)         -- shown in the delete question
       b.text:SetText(string.format("%s (%d)", e.m.name or ("ID " .. e.id), e.m.kills))
       b.sel:SetShown(e.id == ns.selectedMob)
     end
@@ -276,19 +411,27 @@ function ns.RefreshMobs(db)
   -- Right side: header and drops for the selected mob
   local m = ns.selectedMob and db.mobs[ns.selectedMob]
   if not m then
-    ui.mobHeader:SetText("No mob drops recorded yet.")
+    ui.mobHeader:SetText(EmptyMessage())
     for i = 1, #dropRows do dropRows[i]:Hide() end
     return
   end
-  ui.mobHeader:SetText(string.format("|cffffd100%s|r  (ID %d)\nKills: %d\nZones: %s",
-    m.name or "Unknown", ns.selectedMob, m.kills, ZoneText(m)))
+  -- Line 2: kills and zones. Line 3: your first and latest kill, with date and
+  -- time (only for kills recorded since dates were added).
+  local line2 = "Kills: " .. m.kills .. "     Zones: " .. ZoneText(m)
+  local line3 = ""
+  if m.firstKill then
+    line3 = "\nFirst: " .. ns.DateTimeText(m.firstKill) ..
+            "     Last: " .. ns.DateTimeText(m.lastKill or m.firstKill)
+  end
+  ui.mobHeader:SetText(string.format("|cffffd100%s|r  (ID %d)\n%s%s",
+    m.name or "Unknown", ns.selectedMob, line2, line3))
 
-  local drops = SortedDrops(m)
+  local drops = SortedDrops(db, m)
   local kills = math.max(m.kills, 1)   -- avoid dividing by zero
 
   -- Row 1 is the coin row (gold coin picture) when this creature has dropped
   -- any coin. The items follow it, so they start `first` rows further down.
-  local hasCoin = m.gold and m.gold > 0
+  local hasCoin = m.gold and m.gold > 0 and s.rarity == "all"   -- coin has no rarity
   local first = hasCoin and 1 or 0
   if hasCoin then
     local r = GetDropRow(1)
@@ -299,7 +442,7 @@ function ns.RefreshMobs(db)
     r.name:SetText("Coin  " .. ns.FormatMoney(m.gold))
     r.id:SetText("-")
     r.qty:SetText("")
-    r.rate:SetText(string.format("%d/%d (%.1f%%)", coinDrops, kills, 100 * coinDrops / kills))
+    r.rate:SetText(ns.RateText(coinDrops, m.kills))
     r:Show()
   end
 
@@ -313,7 +456,7 @@ function ns.RefreshMobs(db)
     r.id:SetText(d.id)
     r.qty:SetText("x" .. d.it.qty)
     -- Drop rate: times it dropped / total kills
-    r.rate:SetText(string.format("%d/%d (%.1f%%)", d.it.drops, kills, 100 * d.it.drops / kills))
+    r.rate:SetText(ns.RateText(d.it.drops, m.kills))
     r:Show()
   end
   for i = #drops + first + 1, #dropRows do dropRows[i]:Hide() end
@@ -374,6 +517,45 @@ function ns.CreateMobPanel(ui)
   end)
   ui.expandButton = eb
 
+  -- Rarity filter drop-down: show only drops of one item quality (and only
+  -- the creatures that have such drops). Choices are ns.RARITY_CHOICES.
+  local rb = CreateFrame("Button", nil, p, "UIPanelButtonTemplate")
+  rb:SetSize(100, 22)
+  rb:SetPoint("LEFT", eb, "RIGHT", 6, 0)
+  rb:SetScript("OnClick", function(self)
+    if not ns.ShowChoiceMenu then return end   -- the drop-down helper lives in PageHunt.lua
+    ns.ShowChoiceMenu(self, ns.RARITY_CHOICES, ns.Settings().rarity, function(key)
+      ns.Settings().rarity = key               -- saved with your settings
+      ns.Refresh()
+    end)
+  end)
+  ui.rarityButton = rb
+
+  -- Search box: type part of a creature name, item name, zone, or a creature
+  -- ID to filter the list (both the two-pane and the Expanded view).
+  local sb = CreateFrame("EditBox", nil, p, "InputBoxTemplate")
+  sb:SetSize(120, 20)
+  sb:SetPoint("LEFT", rb, "RIGHT", 8, 0)
+  sb:SetAutoFocus(false)            -- don't grab the keyboard when the window opens
+  sb:SetMaxLetters(30)
+  local hint = sb:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")   -- grey "Search..." while empty
+  hint:SetPoint("LEFT", 6, 0)
+  hint:SetText("Search...")
+  hint:SetTextColor(0.5, 0.5, 0.5)
+  sb:SetScript("OnTextChanged", function(self)
+    local text = self:GetText():lower()
+    hint:SetShown(text == "")
+    if text ~= (ns.mobSearch or "") then
+      ns.mobSearch = text           -- session only, not saved
+      ns.Refresh()
+    end
+  end)
+  sb:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+  sb:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+  ui.mobSearchBox = sb
+
+
+
   -- ---- Two-pane view container (everything below the controls bar) ----
   local split = CreateFrame("Frame", nil, p)
   split:SetPoint("TOPLEFT", 0, -30)
@@ -383,12 +565,17 @@ function ns.CreateMobPanel(ui)
   -- Left: scrolling list of mobs
   local ms = CreateFrame("ScrollFrame", nil, split, "UIPanelScrollFrameTemplate")
   ms:SetPoint("TOPLEFT", 0, 0)
-  ms:SetPoint("BOTTOMLEFT", 0, 0)
+  ms:SetPoint("BOTTOMLEFT", 0, 18)   -- leaves a line underneath for the totals
   ms:SetWidth(170)
   local mc = CreateFrame("Frame", nil, ms)
   mc:SetSize(165, 10)
   ms:SetScrollChild(mc)
   ui.mobContent = mc
+
+  -- Totals under the mob list (filled in by RefreshMobs)
+  ui.mobSummary = split:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  ui.mobSummary:SetPoint("BOTTOMLEFT", split, "BOTTOMLEFT", 4, 2)
+  ui.mobSummary:SetTextColor(0.7, 0.7, 0.7)
 
   -- Right: header text (3 lines: name, kills, zones)
   ui.mobHeader = split:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
@@ -398,17 +585,36 @@ function ns.CreateMobPanel(ui)
 
   -- Right: column headings. x positions must line up with the row
   -- columns defined in GetDropRow (22, 216, 276, 320).
-  local function col(txt, cx, w)
-    local f = split:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    f:SetPoint("TOPLEFT", 205 + cx, -58)
-    f:SetWidth(w)
-    f:SetJustifyH("LEFT")
-    f:SetText(txt)
+  -- Each heading is a button: click it to sort the table by that column,
+  -- click it again to reverse. RefreshMobs adds the arrow to the active one.
+  ui.dropHeads = {}
+  local function col(key, txt, cx, w)
+    local hb = CreateFrame("Button", nil, split)
+    hb:SetPoint("TOPLEFT", 205 + cx, -56)
+    hb:SetSize(w, 16)
+    hb.text = hb:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    hb.text:SetPoint("LEFT", 0, 0)
+    hb.text:SetJustifyH("LEFT")
+    hb.label = txt
+    local hl = hb:CreateTexture(nil, "HIGHLIGHT")   -- mouse-over highlight
+    hl:SetAllPoints()
+    hl:SetColorTexture(1, 1, 1, 0.1)
+    hb:SetScript("OnClick", function()
+      local st = ns.Settings()
+      if st.dropSort == key then
+        st.dropDesc = not st.dropDesc                      -- same heading again: reverse
+      else
+        st.dropSort = key
+        st.dropDesc = (key == "qty" or key == "rate")      -- numbers start biggest first, names A to Z
+      end
+      ns.Refresh()
+    end)
+    ui.dropHeads[key] = hb
   end
-  col("Item", 22, 190)
-  col("ID", 216, 55)
-  col("Qty", 276, 40)
-  col("Drop rate", 320, 140)
+  col("name", "Item", 22, 190)
+  col("id", "ID", 216, 55)
+  col("qty", "Qty", 276, 40)
+  col("rate", "Drop rate", 320, 140)
 
   -- Right: scrolling table of the selected mob's drops
   local ds = CreateFrame("ScrollFrame", nil, split, "UIPanelScrollFrameTemplate")
