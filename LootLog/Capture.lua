@@ -85,6 +85,21 @@ local function CacheName(unit)
       -- (elite, rare, worldboss...). The classification gives a default
       -- Elite / Rare / Boss tag; see ns.GetClass in Core.lua.
       k.ctype = ctype or k.ctype
+      k.lastSeen = time()   -- when you last pointed at or targeted it (the Hunting Log's "Most recently seen" sort)
+      -- The level the game shows (-1 means ??). The Hunting Log goes by this over the list.
+      -- A creature far above YOUR level shows ?? too, so a ?? only counts once you
+      -- are at the top level; below that it says nothing and the old level stays.
+      local lvl, mine = UnitLevel(unit), UnitLevel("player")
+      if type(lvl) == "number" and type(mine) == "number"
+         and not (issecretvalue and (issecretvalue(lvl) or issecretvalue(mine))) then
+        if lvl >= 0 then
+          k.level = lvl
+          k.lvlBy = mine
+        elseif mine >= ns.MAX_LEVEL then
+          k.level = -1
+          k.lvlBy = mine
+        end
+      end
       local newClass = UnitClassification(unit)
       if newClass and newClass ~= k.uclass then
         k.uclass = newClass
@@ -228,7 +243,14 @@ end
 local ctx = {
   gather = nil,     -- { kind = "Mining", time = when you cast it, used = false }
   questTime = 0,    -- when you last turned in a quest
+  lastMoney = nil,  -- the money you carried at the last change (to see how much it rose)
+  tradeClosed = 0,  -- when a trade window last closed
+  visitGold = 0,    -- gold sold for during the current vendor visit
   vendor = false,   -- a vendor window is open
+  vendorName = nil, -- the name of that vendor
+  questOpen = false,  -- a quest reward window is open
+  lastCast = nil,   -- your last spell: { name, target, time }
+  tradePartner = nil, tradeSnap = nil,   -- who you are trading with, and what was in the window when both accepted
   mail = false,     -- the mailbox is open
   trade = false,    -- a trade window is open
   questID = nil,    -- which quest you last turned in
@@ -298,6 +320,15 @@ local function CategoryFor(guid, kind, fishing)
   return (kind == "Creature" and "Mobs") or (kind == "GameObject" and "Objects") or "Other"
 end
 
+-- The name of the chest or other object you just opened: the last object you
+-- pointed at (Tooltips.lua remembers it), or the target of your last cast.
+local function RecentObjectName()
+  local o = ns.lastObject
+  if o and GetTime() - o.time < 15 then return o.name end
+  local c = ctx.lastCast
+  if c and c.target and GetTime() - c.time < 10 then return c.target end
+end
+
 -- Gathering is also logged per NODE: which vein, herb, skinned creature, or
 -- chest the loot came from. db.gather[category][zone][nodeKey] =
 --   { id = object or creature ID, kind, gathers = times, items = { [itemID] = qty } }
@@ -317,9 +348,15 @@ local function NoteNode(guid, kind, id, category, zone)
 
   -- The name: what you cast the profession on, or a known creature name
   local name = gatherName[guid] or (kind == "Creature" and names[objectID]) or nil
+  local guessed = false
+  if not name and kind == "GameObject" then
+    name = RecentObjectName()   -- a chest has no gathering spell: use what you pointed at
+    guessed = true
+  end
   if name then
     db.nodeNames = db.nodeNames or {}
-    db.nodeNames[key] = name
+    -- a guessed name never replaces one we already trust
+    if not guessed or not db.nodeNames[key] then db.nodeNames[key] = name end
   end
 
   db.gather = db.gather or {}
@@ -378,6 +415,19 @@ local function LogEvent(category, itemID, qty, link, zone)
   e.count = e.count + (qty or 1)
   e.quality = e.quality or ns.ItemQuality(db, itemID)   -- read from the item link (Core.lua)
   zz[itemID] = e
+end
+
+-- The record of one vendor in one zone: db.vendors[zone][vendorName] =
+-- { sold = copper you got from selling, soldTimes, bought = { [itemID] = quantity } }.
+-- Created if needed.
+local function VendorRecord(zone, name)
+  local db = ns.DB()
+  db.vendors = db.vendors or {}
+  local z = db.vendors[zone]
+  if not z then z = {}; db.vendors[zone] = z end
+  local v = z[name]
+  if not v then v = { sold = 0, soldTimes = 0, bought = {} }; z[name] = v end
+  return v
 end
 
 -- Turns a game message format such as "You receive item: %s." into a pattern
@@ -480,6 +530,7 @@ end
 -- The quest reward window opened: remember the quest's title, as a backup
 -- for when the turn-in event does not give us a name.
 local function OnQuestComplete()
+  ctx.questOpen = true   -- items that arrive while this window is open are quest rewards
   local ok, title = pcall(GetTitleText)
   if ok and type(title) == "string" and not issecret(title) then ctx.questTitle = title end
 end
@@ -491,6 +542,30 @@ local function OnQuestLoot(questID, link, qty)
   if itemID then
     LogQuestReward(itemID, (type(qty) == "number" and not issecret(qty)) and qty or 1, link, "QUEST_LOOT_RECEIVED", questID)
   end
+end
+
+-- What kind of crafting just made an item ("Blacksmithing", "Smelting"...).
+-- Smelting is a Mining spell ("Smelt Copper"), so it is told apart by the name
+-- of the spell you just cast; otherwise the profession window that is open names it.
+local function CraftTypeNow()
+  local c = ctx.lastCast
+  local recent = c and c.name and (GetTime() - c.time) < 20
+  if recent and c.name:find("^Smelt") then return "Smelting" end
+
+  local line
+  pcall(function()
+    if GetTradeSkillLine then
+      line = GetTradeSkillLine()
+    elseif C_TradeSkillUI and C_TradeSkillUI.GetBaseProfessionInfo then
+      local info = C_TradeSkillUI.GetBaseProfessionInfo()
+      line = info and info.professionName
+    end
+  end)
+  if type(line) == "string" and line ~= "" and line ~= "UNKNOWN" and not issecret(line) then
+    if line == "Mining" then return "Smelting" end   -- the Mining window only crafts by smelting
+    return line
+  end
+  return "Other crafting"
 end
 
 -- An item message in chat. Items that arrive WITHOUT a loot window are sorted
@@ -508,7 +583,7 @@ local function OnChatLoot(text)
 
   -- Quest rewards also reported by QUEST_LOOT_RECEIVED: the 5 second guard
   -- inside LogQuestReward stops them being counted twice.
-  if kind == "received" and GetTime() - ctx.questTime <= 3 then
+  if kind == "received" and (ctx.questOpen or GetTime() - ctx.questTime <= 3) then
     LogQuestReward(itemID, qty, link, "chat")
     return
   end
@@ -521,6 +596,18 @@ local function OnChatLoot(text)
   else category = "Other received" end
 
   LogEvent(category, itemID, qty, link, GetRealZoneText() or "Unknown")
+  if category == "Crafting" then   -- and what kind of crafting made it
+    local db = ns.DB()
+    db.crafting = db.crafting or {}
+    local craftType = CraftTypeNow()
+    local ct = db.crafting[craftType]
+    if not ct then ct = {}; db.crafting[craftType] = ct end
+    ct[itemID] = (ct[itemID] or 0) + (qty or 1)
+  end
+  if category == "Vendor" then   -- remember which vendor sold it to you
+    local v = VendorRecord(GetRealZoneText() or "Unknown", ctx.vendorName or "Unknown vendor")
+    v.bought[itemID] = (v.bought[itemID] or 0) + (qty or 1)
+  end
   kdebug("received:", link or itemID, "x" .. tostring(qty), "->", category)
   if ns.RefreshIfOpen then ns.RefreshIfOpen() end
 end
@@ -533,8 +620,238 @@ local function OnSpellSent(unit, target, castGUID, spellID)
   -- target = what the spell was cast on, for example "Copper Vein" or "Peacebloom"
   local targetName
   if type(target) == "string" and not issecret(target) and target ~= "" then targetName = target end
+  ctx.lastCast = { name = SpellNameOf(spellID), target = targetName, time = GetTime() }   -- (crafting type, object names)
   kdebug("cast:", spellID, SpellNameOf(spellID) or "?", "on", tostring(targetName), kind and ("-> " .. kind) or "")
   if kind then ctx.gather = { kind = kind, time = GetTime(), used = false, target = targetName } end
+end
+
+
+-- =====================================================================
+-- GOLD RECEIVED FROM VENDORS, MAIL, AND TRADES
+-- =====================================================================
+-- Selling to a vendor, taking gold from the mail, and trades give you money
+-- without a loot window or a chat line, so we watch the money you carry:
+-- PLAYER_MONEY fires on every change, and a RISE while a vendor window, the
+-- mailbox, or a trade is open is gold received. (Money from loot and quests
+-- is counted elsewhere and is not counted again here.)
+
+-- Adds gold received (copper) under a category: "Vendor", "Mail" or "Trades".
+-- db.moneyIn[category] = { total, times, zones = { [zone] = copper } }
+local function AddMoneyIn(category, zone, copper)
+  local db = ns.DB()
+  db.moneyIn = db.moneyIn or {}
+  local c = db.moneyIn[category]
+  if not c then c = { total = 0, times = 0, zones = {} }; db.moneyIn[category] = c end
+  c.total = c.total + copper
+  c.times = c.times + 1
+  c.zones[zone] = (c.zones[zone] or 0) + copper
+end
+
+-- Your money changed.
+local function OnPlayerMoney()
+  local ok, now = pcall(GetMoney)
+  if not ok or type(now) ~= "number" or issecret(now) then return end
+  local before = ctx.lastMoney
+  ctx.lastMoney = now
+  if not before or now <= before then return end   -- first reading, or money was spent
+  local gained = now - before
+
+  local category
+  if ctx.vendor then category = "Vendor"
+  elseif ctx.mail then category = "Mail"
+  -- a trade's gold arrives about when the window closes, so allow 2 seconds after
+  elseif ctx.trade or (GetTime() - ctx.tradeClosed) < 2 then category = "Trades" end
+  if not category then return end
+
+  local zone = GetRealZoneText() or "Unknown"
+  AddMoneyIn(category, zone, gained)
+  if category == "Vendor" then
+    ctx.visitGold = ctx.visitGold + gained
+    local v = VendorRecord(zone, ctx.vendorName or "Unknown vendor")   -- gold from selling to THIS vendor
+    v.sold = v.sold + gained
+    v.soldTimes = v.soldTimes + 1
+  end
+  kdebug("gold received:", ns.FormatMoney(gained), "->", category)
+  if ns.RefreshIfOpen then ns.RefreshIfOpen() end
+end
+
+
+-- =====================================================================
+-- WHAT YOU DO WITH YOUR LOOT: SELLING, AUCTIONS, TRADES
+-- =====================================================================
+-- db.sales[itemID] = { vendorCount, vendorGold, aucCount, aucGold } counts what
+-- you sold of each item and what it brought in (copper). The Mob Drops page
+-- shows it under "Gold made from items".
+--   Vendors   a right-click sale in your bags while a vendor window is open
+--             (the price is the item's vendor sell price times the stack)
+--   Auctions  taking the proceeds from an "Auction successful" mail; the mail
+--             names the item and holds the gold
+--   Trades    db.trades keeps a log: what you gave and got in each trade
+-- None of this changes the gold totals above (those come from your money).
+
+local function SaleRecord(itemID)
+  local db = ns.DB()
+  db.sales = db.sales or {}
+  local s = db.sales[itemID]
+  if not s then s = { vendorCount = 0, vendorGold = 0, aucCount = 0, aucGold = 0 }; db.sales[itemID] = s end
+  return s
+end
+
+-- You right-clicked an item in a bag. With a vendor window open that sells it.
+local lastSaleKey, lastSaleTime = nil, 0
+local function OnUseContainerItem(bag, slot)
+  if not ctx.vendor then return end
+  pcall(function()
+    local link, count
+    if C_Container and C_Container.GetContainerItemInfo then
+      local info = C_Container.GetContainerItemInfo(bag, slot)
+      if info then link, count = info.hyperlink, info.stackCount end
+    elseif GetContainerItemInfo then
+      local _, c, _, _, _, _, l = GetContainerItemInfo(bag, slot)
+      link, count = l, c
+    end
+    if type(link) ~= "string" then return end
+    local itemID = tonumber(link:match("item:(%d+)"))
+    if not itemID then return end
+
+    -- The old and the new bag function can both report one click: count it once
+    local key, now = tostring(bag) .. ":" .. tostring(slot), GetTime()
+    if key == lastSaleKey and now - lastSaleTime < 0.3 then return end
+    lastSaleKey, lastSaleTime = key, now
+
+    -- The vendor's price for ONE item is the 11th value of GetItemInfo
+    local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+    local price = select(11, getInfo(link))
+    if type(price) ~= "number" or price <= 0 then return end   -- no value: the vendor will not buy it
+    count = count or 1
+
+    local sr = SaleRecord(itemID)
+    sr.vendorCount = sr.vendorCount + count
+    sr.vendorGold = sr.vendorGold + price * count
+    -- also under the vendor you sold it to
+    local v = VendorRecord(GetRealZoneText() or "Unknown", ctx.vendorName or "Unknown vendor")
+    v.soldItems = v.soldItems or {}
+    local si = v.soldItems[itemID]
+    if not si then si = { n = 0, gold = 0 }; v.soldItems[itemID] = si end
+    si.n = si.n + count
+    si.gold = si.gold + price * count
+    kdebug("sold to vendor:", link, "x" .. count, ns.FormatMoney(price * count))
+    local db = ns.DB(); db.items = db.items or {}; db.items[itemID] = db.items[itemID] or link
+  end)
+end
+
+-- You took the gold (or everything) from a mail. If it is an auction sale, the
+-- mail's invoice names the item, so the gold is credited to that item.
+local lastMailKey, lastMailTime = nil, 0
+local function OnTakeMail(index)
+  if not ctx.mail or type(index) ~= "number" then return end
+  pcall(function()
+    local header = GetInboxHeaderInfo or (C_Mail and C_Mail.GetInboxHeaderInfo)
+    if not header then return end
+    local _, _, _, subject, money = header(index)
+    if type(subject) ~= "string" or type(money) ~= "number" or money <= 0 then return end
+
+    -- Only auction sales: the subject reads "Auction successful: <item>"
+    local pattern = AUCTION_SOLD_MAIL_SUBJECT and FormatToPattern(AUCTION_SOLD_MAIL_SUBJECT)
+    local nameFromSubject = pattern and subject:match(pattern)
+    if not nameFromSubject then return end
+
+    local key, now = index .. ":" .. subject .. ":" .. money, GetTime()
+    if key == lastMailKey and now - lastMailTime < 1 then return end
+    lastMailKey, lastMailTime = key, now
+
+    -- The invoice gives the exact item name and how many were sold
+    local invoice = GetInboxInvoiceInfo or (C_Mail and C_Mail.GetInboxInvoiceInfo)
+    local itemName, itemCount = nameFromSubject, 1
+    if invoice then
+      -- GetInboxInvoiceInfo returns: invoiceType, itemName, playerName, bid, buyout,
+      -- deposit, consignment, moneyDelay, etaHour, etaMin, count (the 11th value)
+      local r = { invoice(index) }
+      local invoiceType, name, count = r[1], r[2], r[11]
+      if invoiceType == "seller" and type(name) == "string" and name ~= "" then
+        itemName = name
+        itemCount = (type(count) == "number" and count > 0) and count or 1
+      end
+    end
+
+    -- Find the item ID from the links we have saved
+    local db = ns.DB()
+    local itemID
+    for id, link in pairs(db.items or {}) do
+      if link:match("%[(.-)%]") == itemName then itemID = id; break end
+    end
+    if not itemID then kdebug("auction sale of an item we have no ID for:", itemName); return end
+
+    local sr = SaleRecord(itemID)
+    sr.aucCount = sr.aucCount + itemCount
+    sr.aucGold = sr.aucGold + money
+    kdebug("auction sale:", itemName, "x" .. itemCount, ns.FormatMoney(money))
+    if ns.RefreshIfOpen then ns.RefreshIfOpen() end
+  end)
+end
+
+-- Hook the bag and mail functions (both the old global names and the newer
+-- C_Container / C_Mail ones; whichever exist). Hooks run AFTER the game's own
+-- function, and cannot change what it does.
+pcall(function()
+  if UseContainerItem then hooksecurefunc("UseContainerItem", OnUseContainerItem) end
+  if C_Container and C_Container.UseContainerItem then hooksecurefunc(C_Container, "UseContainerItem", OnUseContainerItem) end
+  if TakeInboxMoney then hooksecurefunc("TakeInboxMoney", OnTakeMail) end
+  if AutoLootMailItem then hooksecurefunc("AutoLootMailItem", OnTakeMail) end
+  if C_Mail then
+    if C_Mail.TakeInboxMoney then hooksecurefunc(C_Mail, "TakeInboxMoney", OnTakeMail) end
+    if C_Mail.AutoLootMailItem then hooksecurefunc(C_Mail, "AutoLootMailItem", OnTakeMail) end
+  end
+end)
+
+-- Both sides pressed Accept: remember what is in the trade window now. It is
+-- written to the trade log when the window closes.
+local function OnTradeAccept(playerAccepted, targetAccepted)
+  if not (playerAccepted == 1 and targetAccepted == 1) then return end
+  local snap = { at = GetTime(), gave = {}, got = {}, gaveGold = 0, gotGold = 0, partner = ctx.tradePartner or "Unknown" }
+  pcall(function()
+    local db = ns.DB()
+    db.items = db.items or {}
+    for i = 1, 6 do
+      local link = GetTradePlayerItemLink(i)
+      if link then
+        local id = tonumber(link:match("item:(%d+)"))
+        if id then
+          local _, _, n = GetTradePlayerItemInfo(i)
+          snap.gave[id] = (snap.gave[id] or 0) + (n or 1)
+          db.items[id] = db.items[id] or link
+        end
+      end
+      local tlink = GetTradeTargetItemLink(i)
+      if tlink then
+        local id = tonumber(tlink:match("item:(%d+)"))
+        if id then
+          local _, _, n = GetTradeTargetItemInfo(i)
+          snap.got[id] = (snap.got[id] or 0) + (n or 1)
+          db.items[id] = db.items[id] or tlink
+        end
+      end
+    end
+    snap.gaveGold = GetPlayerTradeMoney() or 0
+    snap.gotGold = GetTargetTradeMoney() or 0
+  end)
+  ctx.tradeSnap = snap
+end
+
+-- The trade window closed. If both had accepted just before, log the trade:
+-- db.trades (newest first, the last 200) = { t, partner, zone, gave, got, gaveGold, gotGold }.
+local function LogTrade()
+  local snap = ctx.tradeSnap
+  ctx.tradeSnap = nil
+  if not snap or GetTime() - snap.at > 10 then return end
+  if next(snap.gave) == nil and next(snap.got) == nil and snap.gaveGold == 0 and snap.gotGold == 0 then return end
+  local db = ns.DB()
+  db.trades = db.trades or {}
+  table.insert(db.trades, 1, { t = time(), partner = snap.partner, zone = GetRealZoneText() or "Unknown",
+                               gave = snap.gave, got = snap.got, gaveGold = snap.gaveGold, gotGold = snap.gotGold })
+  while #db.trades > 200 do table.remove(db.trades) end
+  kdebug("trade logged with", snap.partner)
+  if ns.RefreshIfOpen then ns.RefreshIfOpen() end
 end
 
 
@@ -661,7 +978,7 @@ pcall(f.RegisterEvent, f, "CHAT_MSG_LOOT")             -- "You receive item: ...
 -- client refuses are listed by /lootlog kills.
 ns.failedEvents = {}
 for _, ev in ipairs({ "MERCHANT_SHOW", "MERCHANT_CLOSED", "MAIL_SHOW", "MAIL_CLOSED",
-                      "TRADE_SHOW", "TRADE_CLOSED" }) do
+                      "TRADE_SHOW", "TRADE_CLOSED", "PLAYER_MONEY", "TRADE_ACCEPT_UPDATE", "QUEST_FINISHED" }) do
   if not pcall(f.RegisterEvent, f, ev) then ns.failedEvents[#ns.failedEvents + 1] = ev end
 end
 pcall(f.RegisterUnitEvent, f, "UNIT_SPELLCAST_SENT", "player")          -- you began a cast
@@ -684,12 +1001,32 @@ f:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
   if event == "QUEST_TURNED_IN" then return OnQuestTurnedIn(arg1, arg2, arg3) end
   if event == "QUEST_LOOT_RECEIVED" then return OnQuestLoot(arg1, arg2, arg3) end
   if event == "CHAT_MSG_LOOT" then return OnChatLoot(arg1) end
-  if event == "MERCHANT_SHOW" then ctx.vendor = true; return end
-  if event == "MERCHANT_CLOSED" then ctx.vendor = false; return end
+  if event == "PLAYER_MONEY" then return OnPlayerMoney() end
+  if event == "MERCHANT_SHOW" then
+    ctx.vendor = true
+    ctx.visitGold = 0
+    -- Who you are talking to ("npc" is the unit you are interacting with)
+    local ok, n = pcall(UnitName, "npc")
+    ctx.vendorName = (ok and type(n) == "string" and n ~= "" and not issecret(n)) and n or "Unknown vendor"
+    return
+  end
+  if event == "MERCHANT_CLOSED" then
+    ctx.vendor = false
+    if ctx.visitGold > 0 and ns.AnnounceSale then ns.AnnounceSale(ctx.visitGold, ctx.vendorName) end   -- a line about the sale (Messages.lua)
+    ctx.visitGold = 0
+    return
+  end
   if event == "MAIL_SHOW" then ctx.mail = true; return end
   if event == "MAIL_CLOSED" then ctx.mail = false; return end
-  if event == "TRADE_SHOW" then ctx.trade = true; return end
-  if event == "TRADE_CLOSED" then ctx.trade = false; return end
+  if event == "TRADE_SHOW" then
+    ctx.trade = true
+    local ok, n = pcall(UnitName, "NPC")   -- in a trade, the other player is the "NPC" unit
+    ctx.tradePartner = (ok and type(n) == "string" and n ~= "" and not issecret(n)) and n or "Unknown"
+    return
+  end
+  if event == "TRADE_ACCEPT_UPDATE" then return OnTradeAccept(arg1, arg2) end
+  if event == "QUEST_FINISHED" then ctx.questOpen = false; ctx.questTime = GetTime(); return end
+  if event == "TRADE_CLOSED" then ctx.trade = false; ctx.tradeClosed = GetTime(); LogTrade(); return end
   if event == "UNIT_SPELLCAST_SENT" then return OnSpellSent(arg1, arg2, arg3, arg4) end
   if event == "UNIT_SPELLCAST_INTERRUPTED" or event == "UNIT_SPELLCAST_FAILED" then
     if ctx.gather and not ctx.gather.used then ctx.gather = nil end   -- the gather did not happen
@@ -709,6 +1046,7 @@ f:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
   -- Zone events: remember the place, redraw if the window is open, and stop.
   if event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED_NEW_AREA"
      or event == "ZONE_CHANGED" or event == "ZONE_CHANGED_INDOORS" then
+    if event == "PLAYER_ENTERING_WORLD" then pcall(function() ctx.lastMoney = GetMoney() end) end   -- starting point for money changes
     ns.NoteVisited()
     if ns.RefreshIfOpen then ns.RefreshIfOpen() end
     return
@@ -744,7 +1082,7 @@ f:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
     -- Only item slots. Money and currency slots are skipped for now.
     if GetLootSlotType(slot) == ITEM_SLOT then
       local link = GetLootSlotLink(slot)
-      local icon, name, qty, _, quality = GetLootSlotInfo(slot)
+      local icon, name, qty, _, quality, _, isQuestItem = GetLootSlotInfo(slot)
       -- Pull the item ID out of the link text ("...|Hitem:12345:...|h...")
       local itemID = link and tonumber(link:match("item:(%d+)"))
       if itemID then
@@ -753,6 +1091,12 @@ f:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         db.items[itemID] = link
         db.icons = db.icons or {}
         db.icons[itemID] = icon
+        -- The loot window says when an item belongs to a quest; remember it
+        -- (shared by all characters) so the drop lists can set quest items apart
+        if isQuestItem then
+          db.questItems = db.questItems or {}
+          db.questItems[itemID] = true
+        end
 
         -- One item slot can come from several corpses (area loot), so loop
         -- over every source. src = { guid1, qty1, guid2, qty2, ... }

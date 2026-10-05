@@ -66,14 +66,24 @@ function ns.Refresh()
   end
   -- Leave room above the text for the tab buttons
   ui.scroll:ClearAllPoints()
+  ui.questSearch:SetShown(ns.currentPage == "quest" and ns.GetSubTab("quest") ~= "rewards")
   -- The Help page has its own row of check boxes, so it needs the room too
   local isHelp = (ns.currentPage == "help")
   ui.helpControls:SetShown(isHelp)
   local level = ns.Settings().messageLevel
   ui.reduceCheck:SetChecked(level == "reduced")
   ui.stopCheck:SetChecked(level == "off")
-  ui.scroll:SetPoint("TOPLEFT", ui, "TOPLEFT", 160, (tabs or isHelp) and -62 or -32)
-  ui.scroll:SetPoint("BOTTOMRIGHT", ui, "BOTTOMRIGHT", -32, 12)
+  local top = (tabs or isHelp) and -62 or -32
+  -- A text page may have a list on the right (ns.SIDE_BUILDERS)
+  local sideBuilder = (not isMobs and not isHunt and not isFish) and ns.SIDE_BUILDERS and ns.SIDE_BUILDERS[ns.currentPage] or nil
+  ui.side:SetShown(sideBuilder ~= nil)
+  if sideBuilder then
+    ui.side:ClearAllPoints()
+    ui.side:SetPoint("TOPRIGHT", ui, "TOPRIGHT", -12, top)
+    ui.side:SetPoint("BOTTOMRIGHT", ui, "BOTTOMRIGHT", -12, 12)
+  end
+  ui.scroll:SetPoint("TOPLEFT", ui, "TOPLEFT", 160, top)
+  ui.scroll:SetPoint("BOTTOMRIGHT", ui, "BOTTOMRIGHT", sideBuilder and -262 or -32, 12)
   if isMobs then
     ns.RefreshMobs(db)
   elseif isHunt then
@@ -81,8 +91,15 @@ function ns.Refresh()
   elseif isFish then
     ns.RefreshFish(db)
   else
+    local width = sideBuilder and 410 or 650   -- narrower when there is a side list
+    ui.text:SetWidth(width)
+    ui.content:SetWidth(width)
     ui.text:SetText(ns.BUILDERS[ns.currentPage](db))
     ui.content:SetHeight(ui.text:GetStringHeight() + 10)
+    if sideBuilder then
+      ui.sideText:SetText(sideBuilder(db))
+      ui.sideContent:SetHeight(ui.sideText:GetStringHeight() + 10)
+    end
   end
   -- Keep the active menu button visually pressed
   for key, b in pairs(ui.navButtons) do
@@ -163,6 +180,30 @@ local function CreateUI()
     ui.navButtons[page.key] = b
   end
 
+  -- Quest search box, shown on the Quest Rewards page next to the tabs (not on
+  -- the Rewards tab). Type part of a quest name, a zone, or a level.
+  local qs = CreateFrame("EditBox", nil, ui, "InputBoxTemplate")
+  qs:SetSize(150, 20)
+  qs:SetPoint("TOPLEFT", 160 + 4 * 132 + 14, -35)
+  qs:SetAutoFocus(false)
+  qs:SetMaxLetters(30)
+  local qsHint = qs:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  qsHint:SetPoint("LEFT", 6, 0)
+  qsHint:SetText("Search quests...")
+  qsHint:SetTextColor(0.5, 0.5, 0.5)
+  qs:SetScript("OnTextChanged", function(self)
+    local text = self:GetText():lower()
+    qsHint:SetShown(text == "")
+    if text ~= (ns.questSearch or "") then
+      ns.questSearch = text          -- session only, not saved
+      ns.Refresh()
+    end
+  end)
+  qs:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+  qs:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+  qs:Hide()
+  ui.questSearch = qs
+
   -- "All characters" check box, above the Help button. Ticked: every
   -- character's data is added together and shown read-only. Unticked: only the
   -- character you are playing.
@@ -225,6 +266,27 @@ local function CreateUI()
   text:SetWidth(650)
   text:SetJustifyH("LEFT")
   ui.scroll, ui.content, ui.text = scroll, content, text
+
+  -- A side list on the right of the text area, for pages that define one in
+  -- ns.SIDE_BUILDERS (PageEvents.lua), for example the totals on the Gathering
+  -- page. It has its own scrollbar and stays in view while the main text scrolls.
+  local side = CreateFrame("Frame", nil, ui)
+  side:SetWidth(240)
+  side:Hide()
+  local sideBg = side:CreateTexture(nil, "BACKGROUND")
+  sideBg:SetAllPoints()
+  sideBg:SetColorTexture(0, 0, 0, 0.25)
+  local sideScroll = CreateFrame("ScrollFrame", nil, side, "UIPanelScrollFrameTemplate")
+  sideScroll:SetPoint("TOPLEFT", 8, -6)
+  sideScroll:SetPoint("BOTTOMRIGHT", -26, 6)
+  local sideContent = CreateFrame("Frame", nil, sideScroll)
+  sideContent:SetSize(200, 10)
+  sideScroll:SetScrollChild(sideContent)
+  local sideText = sideContent:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  sideText:SetPoint("TOPLEFT")
+  sideText:SetWidth(200)
+  sideText:SetJustifyH("LEFT")
+  ui.side, ui.sideContent, ui.sideText = side, sideContent, sideText
 
   -- Tab buttons shown above the text on pages that have tabs (for example
   -- Quest Rewards: Rewards / Completed Quests). Which pages have tabs, and
@@ -297,6 +359,8 @@ loginFrame:SetScript("OnEvent", function()
   RestorePosition(btn, "button")   -- (the first use of the saved data; old data is migrated here)
   ApplyButton()
   ns.TouchCharacter()              -- note who is playing (creates the character's record)
+  ns.CleanClasses()                -- drop saved class choices that match the creature list anyway
+  ns.CleanReceived()               -- once: take quest rewards out of the Received Items tabs
   if ns.migratedTo then
     print("LootLog now keeps each character's data separately. Your existing data was assigned to " ..
           ns.migratedTo .. ".")
@@ -359,6 +423,13 @@ SlashCmdList.LOOTLOG = function(msg)
     end
     ns.SetMessageLevel(level)
     ns.Refresh()   -- keeps the check boxes on the Help page in step
+  elseif msg == "corrections" then
+    -- where the game showed something different from the creature list (name, type,
+    -- designation, level, hostility). The Hunting Log already goes by the game.
+    local list = ns.Corrections(ns.DB())
+    print("LootLog: " .. #list .. " creature(s) where the game differs from the creature list.")
+    for i = 1, math.min(#list, 25) do print("  " .. list[i]) end
+    if #list > 25 then print("  ... and " .. (#list - 25) .. " more. Send your saved file to see them all.") end
   elseif msg == "all" then
     -- same as the "All characters" check box
     local st = ns.Settings()

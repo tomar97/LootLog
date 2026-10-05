@@ -13,8 +13,10 @@
      Critter / Quest) and "Unseen" in the top-right if you have not met it
    - at the bottom: faction badges, and three star slots
  A card is GREYED OUT until you kill that creature once.
- RIGHT-click a card to set its class (Normal / Elite / Rare / Boss /
- Critter / Quest). The same menu has a button to mark a creature "Not in
+ RIGHT-click a card to mark it as a QUEST mob, or to change its designation
+ (Normal / Elite / Rare / Boss / Critter) if the creature list has it wrong.
+ Designations come from the creature list; changes you make can be reviewed
+ with Show > Changed by you. The same menu has a button to mark a creature "Not in
  game version": it disappears from the list but stays in your saved data.
  To see or restore those, use Show > Not in version.
 
@@ -33,8 +35,8 @@
  CONTROLS (top bar of the list view):
    Zone       drop-down: Current zone (follows you), All zones, or a zone
    Type       drop-down: Creatures / Critters / All types
-   Show       drop-down: All / Seen / Unseen / Killed / Not killed / Not in version
-   Sort       drop-down: Name / Most kills / Killed first / Not killed first / Most recent kill
+   Show       drop-down: All / Seen / Unseen / Killed / Not killed / Changed by you / Not in version
+   Sort       drop-down: Name / Most kills / Killed first / Not killed first / Most recent kill / Most recently seen
    (the zone button also shows "killed / creatures" for what is listed)
    Prev / Next   page through the grid
 
@@ -93,6 +95,8 @@ local SEEN_CHOICES = {
   { key = "unseen", label = "Unseen" },
   { key = "killed",    label = "Killed" },
   { key = "notkilled", label = "Not killed", short = "Unkilled" },
+  -- creatures whose designation (or quest mark) you changed by hand
+  { key = "changed", label = "Changed by you", short = "Changed" },
   -- creatures you marked "Not in game version" (hidden from every other list)
   { key = "removed", label = "Not in version", short = "Removed" },
 }
@@ -104,6 +108,7 @@ local SORT_CHOICES = {
   { key = "killed",   label = "Killed first",      short = "Killed" },
   { key = "unkilled", label = "Not killed first",  short = "Unkilled" },
   { key = "recent",   label = "Most recent kill",  short = "Recent" },
+  { key = "seen",     label = "Most recently seen", short = "Seen" },
 }
 
 -- Finds the label for a key in a choices list (used for the button text)
@@ -325,8 +330,18 @@ local function BuildEntries(db, s)
     local r = rec(id)
     r.seen = true
     r.name = k.name or r.name
-    r.crit = r.crit or ns.IsCritterType(k.ctype)
-    r.ctype = r.ctype or k.ctype   -- what the game told us (the starter list is only a fallback)
+    if k.lastSeen then r.seenAt = math.max(r.seenAt or 0, k.lastSeen) end   -- when you last saw it
+    if k.ctype and not r.ctype then
+      r.ctype = k.ctype            -- what the game showed you wins over the creature list
+      r.crit = ns.IsCritterType(k.ctype)
+    end
+    if k.level and not r.level then   -- the level you saw
+      if k.level >= 0 then
+        r.level = tostring(k.level)
+      elseif ns.SeenAsBoss(k) then    -- ?? only counts at the top level (see ns.SeenAsBoss)
+        r.level = "??"
+      end
+    end
     for z in pairs(k.zones or {}) do      -- copy, don't alias the saved table
       r.zones[z] = true
       visited[z] = true
@@ -343,6 +358,7 @@ local function BuildEntries(db, s)
     local r = rec(id)
     r.seen = true
     r.name = m.name or r.name
+    if m.lastKill then r.seenAt = math.max(r.seenAt or 0, m.lastKill) end   -- a kill counts as seeing it
     if m.zones then
       for z in pairs(m.zones) do r.zones[z] = true; visited[z] = true end
     elseif m.zone then
@@ -351,9 +367,10 @@ local function BuildEntries(db, s)
     end
   end
 
-  -- Source 3: starter lists (Seed_*.lua).
-  --   c.fac is "A", "H", or "AH" (which logs it shows in)
-  --   c.host is "neutral" or "hostile" toward those factions
+  -- Source 3: the creature list (Seed_Creatures.lua).
+  --   c.A and c.H say how each faction is treated ("hostile" or "neutral"); a
+  --   faction that is missing does not have the creature in its log.
+  --   (Older rows carry c.fac = "A" / "H" / "AH" and one c.host instead.)
   -- By default every starter creature loads, in every zone it belongs to.
   -- If ns.ONLY_VISITED_ZONES is true (Core.lua), a starter creature only
   -- loads for zones you have been to.
@@ -365,14 +382,25 @@ local function BuildEntries(db, s)
     if info[c.id] or #hit > 0 or not ns.ONLY_VISITED_ZONES then
       local r = rec(c.id)
       r.name = r.name or c.name
-      r.crit = r.crit or ns.IsCritterType(c.ctype)
-      r.ctype = r.ctype or c.ctype
+      if not r.ctype then          -- the list's type is only used when the game has not shown you one
+        r.ctype = c.ctype
+        r.crit = ns.IsCritterType(c.ctype)
+      end
+      r.level = r.level or c.level   -- level or range from the list ("20", "34 - 35", "??")
       for _, z in ipairs(hit) do r.zones[z] = true end
       r.fac = r.fac or {}
-      for letter in c.fac:gmatch(".") do   -- "AH" sets both
-        r.fac[letter] = true
-        -- what you saw in game wins over the starter list
-        if c.host and not r.host[letter] then r.host[letter] = c.host end
+      for _, letter in ipairs({ "A", "H" }) do
+        if c[letter] then
+          r.fac[letter] = true
+          -- what you saw in game wins over the list
+          if not r.host[letter] then r.host[letter] = c[letter] end
+        end
+      end
+      if c.fac then   -- older rows: one hostility for the factions listed
+        for letter in c.fac:gmatch(".") do
+          r.fac[letter] = true
+          if c.host and not r.host[letter] then r.host[letter] = c.host end
+        end
       end
     end
   end
@@ -413,6 +441,7 @@ local function BuildEntries(db, s)
     local zoneOK = ZoneMatches(r, s.huntZone, places)
     local mm = db.mobs[id]
     local killsNow = mm and mm.kills or 0   -- for the Killed / Not killed filters
+    local manual = db.classes and db.classes[id]   -- a designation or quest mark you set by hand
     local gone = ns.IsNotInGame(db, id)   -- marked "not in game version"
     local seenOK
     if s.huntSeen == "removed" then
@@ -422,7 +451,8 @@ local function BuildEntries(db, s)
                    or (s.huntSeen == "seen" and r.seen)
                    or (s.huntSeen == "unseen" and not r.seen)
                    or (s.huntSeen == "killed" and killsNow > 0)
-                   or (s.huntSeen == "notkilled" and killsNow == 0))
+                   or (s.huntSeen == "notkilled" and killsNow == 0)
+                   or (s.huntSeen == "changed" and manual ~= nil))
     end
     if viewOK and zoneOK and seenOK then
       local m = db.mobs[id]
@@ -433,9 +463,11 @@ local function BuildEntries(db, s)
         name = r.name or ("ID " .. id),
         kills = kills,
         last = (m and m.lastKill) or 0,   -- time of the latest kill (0 = none recorded)
+        seenAt = r.seenAt or 0,           -- time you last saw it, or killed it (0 = none recorded)
         class = class,
         crit = r.crit,
         ctype = r.ctype,
+        level = r.level,
         where = ZonesText(r.zones),
         seen = r.seen,
         host = r.host,
@@ -457,6 +489,12 @@ local function BuildEntries(db, s)
       -- creatures never killed last
       local ta = (a.kills > 0) and a.last or -1
       local tb = (b.kills > 0) and b.last or -1
+      if ta ~= tb then return ta > tb end
+    elseif sortKey == "seen" then
+      -- latest sighting first (pointing at it, targeting it, or killing it).
+      -- Creatures met before times were recorded come next, unmet ones last.
+      local ta = a.seen and a.seenAt or -1
+      local tb = b.seen and b.seenAt or -1
       if ta ~= tb then return ta > tb end
     end
     if a.name ~= b.name then return a.name < b.name end
@@ -485,7 +523,7 @@ function ns.HuntDebug()
   print(string.format("LootLog debug: starter creatures loaded: %d | zones loaded: %d | your faction: %s | viewing log: %s",
     seed, zones, tostring(ns.PlayerFaction()), tostring(viewing or "all")))
   if seed == 0 then
-    print("  -> The starter list did not load. Check Seed_A_Neutral.lua is in the LootLog folder AND listed in LootLog.toc.")
+    print("  -> The creature list did not load. Check Seed_Creatures.lua is in the LootLog folder AND listed in LootLog.toc.")
   end
   if zones == 0 then
     print("  -> The zone list did not load. Check ZoneData.lua is in the LootLog folder AND listed in LootLog.toc.")
@@ -509,7 +547,7 @@ function ns.HuntDebug()
   -- Starter creatures that belong to the other faction's log are hidden
   local hidden = 0
   for _, c in ipairs(ns.SeedCreatures or {}) do
-    if viewing and not c.fac:find(viewing, 1, true) then hidden = hidden + 1 end
+    if viewing and not ns.SeedHas(c, viewing) then hidden = hidden + 1 end
   end
   if hidden > 0 then
     print(string.format("  %d starter creatures are hidden because they belong to the other faction's log. (/lootlog faction A, H, all, or mine to change which log shows.)", hidden))
@@ -546,6 +584,13 @@ local function GetDetailRow(i)
   r.id   = fs(298, 60)
   r.qty  = fs(364, 50)
   r.rate = fs(420, 200)
+  -- A thin line across the top of the row, shown only on the divider above the quest items
+  r.line = r:CreateTexture(nil, "ARTWORK")
+  r.line:SetColorTexture(1, 1, 1, 0.3)
+  r.line:SetPoint("TOPLEFT", 0, -1)
+  r.line:SetPoint("TOPRIGHT", 0, -1)
+  r.line:SetHeight(1)
+  r.line:Hide()
   r:SetScript("OnEnter", function(self)
     if self.link or self.tipLines then
       GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
@@ -588,9 +633,11 @@ local function RefreshDetail(db)
   -- Info block to the right of the model.
   -- (A creature description will go here later.)
   local lines = { "ID " .. e.id }
-  if e.ctype and e.ctype ~= "Uncategorized" then lines[#lines + 1] = "Type: " .. e.ctype end
+  if e.ctype and e.ctype ~= "Uncategorized" and e.ctype ~= "Not specified" then lines[#lines + 1] = "Type: " .. e.ctype end
+  if e.level and e.level ~= "" then lines[#lines + 1] = "Level " .. e.level end
   if class ~= "normal" then lines[#lines + 1] = ns.CLASS_LABELS[class] end
   if not seen then lines[#lines + 1] = "Not met yet (starter list)" end
+  if e.seenAt and e.seenAt > 0 then lines[#lines + 1] = "Last seen: " .. ns.DateTimeText(e.seenAt) end
   if ns.IsNotInGame(db, e.id) then lines[#lines + 1] = "Marked: not in game version" end
   for _, letter in ipairs({ "A", "H" }) do
     local state = e.host and e.host[letter]
@@ -608,7 +655,8 @@ local function RefreshDetail(db)
   SetStars(ui.huntDetailStars, StarsFor(kills, class, seen), ns.MaxStars(class))
 
   -- Loot list. Row 1 is the coin row (gold coin picture) when this creature
-  -- has dropped any coin; the items follow it.
+  -- has dropped any coin; the ordinary items follow it, then a divider and the
+  -- quest items.
   local drops = m and SortedDrops(m) or {}
   local killsForRate = math.max(kills, 1)   -- avoid dividing by zero
   local hasCoin = m and m.gold and m.gold > 0
@@ -618,6 +666,8 @@ local function RefreshDetail(db)
     local coinDrops = m.goldDrops or 0
     r.link = nil
     r.tipLines = ns.CoinTipLines(m, kills)  -- hover text for the coin row
+    r.line:Hide()
+    r.icon:Show()
     r.icon:SetTexture(ns.COIN_ICON)
     r.name:SetText("Coin  " .. ns.FormatMoney(m.gold))
     r.id:SetText("-")
@@ -625,11 +675,19 @@ local function RefreshDetail(db)
     r.rate:SetText(ns.RateText(coinDrops, kills))
     r:Show()
   end
-  for i, d in ipairs(drops) do
-    local r = GetDetailRow(i + first)
+
+  local regular, quest = ns.SplitQuestItems(db, drops)
+  local rowIndex = first
+
+  -- Fills the next row with one item
+  local function fillItem(d)
+    rowIndex = rowIndex + 1
+    local r = GetDetailRow(rowIndex)
     local link = db.items and db.items[d.id]
     r.link = link                       -- used by the hover tooltip
     r.tipLines = nil                    -- (only the coin row uses this)
+    r.line:Hide()
+    r.icon:Show()
     r.icon:SetTexture(ns.GetIcon(db, d.id))
     r.name:SetText(link or ("item:" .. d.id))
     r.id:SetText(d.id)
@@ -637,9 +695,26 @@ local function RefreshDetail(db)
     r.rate:SetText(ns.RateText(d.it.drops, kills))
     r:Show()
   end
-  for i = #drops + first + 1, #detailRows do detailRows[i]:Hide() end
-  ui.huntLootContent:SetHeight(math.max((#drops + first) * 20, 1))   -- lets the scrollbar work
-  ui.huntLootEmpty:SetShown(#drops + first == 0)
+
+  for _, d in ipairs(regular) do fillItem(d) end
+  if #quest > 0 then
+    -- The divider: a row with a line across it and a label
+    rowIndex = rowIndex + 1
+    local r = GetDetailRow(rowIndex)
+    r.link = nil
+    r.tipLines = nil
+    r.line:Show()
+    r.icon:Hide()
+    r.name:SetText("|cffffd100Quest items|r")
+    r.id:SetText("")
+    r.qty:SetText("")
+    r.rate:SetText("")
+    r:Show()
+    for _, d in ipairs(quest) do fillItem(d) end
+  end
+  for i = rowIndex + 1, #detailRows do detailRows[i]:Hide() end
+  ui.huntLootContent:SetHeight(math.max(rowIndex * 20, 1))   -- lets the scrollbar work
+  ui.huntLootEmpty:SetShown(rowIndex == 0)
 end
 
 
@@ -716,18 +791,49 @@ end
 -- =====================================================================
 
 -- ----- Class menu (right-click a card) -----
--- Lets you set a creature's class. Saved through ns.SetClass (Core.lua),
--- so it survives reloads and /lootlog reset.
--- To hand the choices to Claude later, upload your SavedVariables file
--- (WTF\Account\<ACCOUNT>\SavedVariables\LootLog.lua); the choices are in
--- its "classes" table.
-local CLASS_CHOICES = { "normal", "elite", "rare", "boss", "critter", "quest" }
+local DESIGNATIONS = { "normal", "elite", "rare", "boss", "critter" }
 
+-- Places the buttons of the class menu one under the other and sizes the
+-- frame to fit. The five designation buttons only show once "Change
+-- designation" has been clicked (classMenu.expanded).
+local function LayoutClassMenu()
+  local m = classMenu
+  local y = -22
+  m.questBtn:ClearAllPoints()
+  m.questBtn:SetPoint("TOP", 0, y)
+  y = y - 26
+  m.changeBtn:ClearAllPoints()
+  m.changeBtn:SetPoint("TOP", 0, y)
+  y = y - 26
+  for _, b in ipairs(m.desBtns) do
+    if m.expanded then
+      b:ClearAllPoints()
+      b:SetPoint("TOP", 10, y)
+      b:Show()
+      y = y - 24
+    else
+      b:Hide()
+    end
+  end
+  m.removedBtn:ClearAllPoints()
+  m.removedBtn:SetPoint("TOP", 0, y - 4)
+  m:SetHeight(-y + 30)
+end
+
+-- The menu opened by right-clicking a card. Three things:
+--   Quest mob            mark (or unmark) the creature as a quest creature
+--   Change designation   pick Normal / Elite / Rare / Boss / Critter if the
+--                        creature list has it wrong
+--   Not in game version  hide the creature (kept in your data)
+-- Choices are saved through ns.SetQuest / ns.SetDesignation (Core.lua). Only
+-- real changes are saved, so Show > Changed by you lists exactly what you
+-- changed, and the same changes appear in the "classes" table of your saved
+-- file if you send it for review.
 local function ShowClassMenu(card)
   CloseMenus()
   if not classMenu then
     classMenu = CreateFrame("Frame", "LootLogClassMenu", UIParent)
-    classMenu:SetSize(160, 200)
+    classMenu:SetSize(160, 130)
     classMenu:SetFrameStrata("FULLSCREEN_DIALOG")   -- above the main window
     classMenu:EnableMouse(true)                     -- so clicks don't pass through
     local bg = classMenu:CreateTexture(nil, "BACKGROUND")
@@ -737,36 +843,70 @@ local function ShowClassMenu(card)
     classMenu.title:SetPoint("TOP", 0, -6)
     classMenu.title:SetWidth(152)
     classMenu.title:SetWordWrap(false)
-    -- One button per class
-    for i, class in ipairs(CLASS_CHOICES) do
+
+    -- Quest mob / Not a quest mob (the text is set each time the menu opens)
+    local qb = CreateFrame("Button", nil, classMenu, "UIPanelButtonTemplate")
+    qb:SetSize(148, 22)
+    qb:SetScript("OnClick", function()
+      ns.SetQuest(classMenu.npcID, not classMenu.isQuest, classMenu.crit)
+      classMenu:Hide()
+      ns.Refresh()
+    end)
+    classMenu.questBtn = qb
+
+    -- Change designation: shows or hides the five choices below it
+    local cb = CreateFrame("Button", nil, classMenu, "UIPanelButtonTemplate")
+    cb:SetSize(148, 22)
+    cb:SetText("Change designation")
+    cb:SetScript("OnClick", function()
+      classMenu.expanded = not classMenu.expanded
+      LayoutClassMenu()
+    end)
+    classMenu.changeBtn = cb
+
+    -- The five designations
+    classMenu.desBtns = {}
+    for i, class in ipairs(DESIGNATIONS) do
       local b = CreateFrame("Button", nil, classMenu, "UIPanelButtonTemplate")
-      b:SetSize(148, 22)
-      b:SetPoint("TOP", 0, -22 - (i - 1) * 24)
-      b:SetText(ns.CLASS_LABELS[class])
-      b:SetScript("OnClick", function()
-        ns.SetClass(classMenu.npcID, class)   -- save the choice
+      b:SetSize(128, 22)
+      b.class = class
+      b:SetScript("OnClick", function(self)
+        ns.SetDesignation(classMenu.npcID, self.class, classMenu.crit)
         classMenu:Hide()
-        ns.Refresh()                          -- redraw cards with new tag and stars
+        ns.Refresh()
       end)
+      b:Hide()
+      classMenu.desBtns[i] = b
     end
-    -- Separate button at the bottom: mark / restore "not in game version".
-    -- Its text is set each time the menu opens (see below).
+
+    -- Mark / restore "not in game version"
     local rb = CreateFrame("Button", nil, classMenu, "UIPanelButtonTemplate")
     rb:SetSize(148, 22)
-    rb:SetPoint("TOP", 0, -22 - #CLASS_CHOICES * 24 - 6)
     rb:SetScript("OnClick", function()
       ns.SetNotInGame(classMenu.npcID, not classMenu.removed)   -- flip the flag
       classMenu:Hide()
       ns.Refresh()                                              -- the creature leaves (or returns to) the list
     end)
     classMenu.removedBtn = rb
+
     tinsert(UISpecialFrames, "LootLogClassMenu")   -- Esc closes it
     classMenu:Hide()
   end
-  classMenu.npcID = card.entry.id
-  classMenu.removed = card.entry.removed
-  classMenu.removedBtn:SetText(card.entry.removed and "Back in game version" or "Not in game version")
-  classMenu.title:SetText(card.entry.name)
+
+  local e = card.entry
+  classMenu.npcID = e.id
+  classMenu.crit = e.crit          -- a critter type (decides what "normal" means for it)
+  classMenu.removed = e.removed
+  classMenu.isQuest = (e.class == "quest")
+  classMenu.expanded = false
+  classMenu.title:SetText(e.name)
+  classMenu.questBtn:SetText(classMenu.isQuest and "Not a quest mob" or "Quest mob")
+  classMenu.removedBtn:SetText(e.removed and "Back in game version" or "Not in game version")
+  for _, b in ipairs(classMenu.desBtns) do
+    -- ">" marks the designation it has now (none when it is a quest mob)
+    b:SetText((b.class == e.class and "> " or "") .. ns.CLASS_LABELS[b.class])
+  end
+  LayoutClassMenu()
   classMenu:ClearAllPoints()
   classMenu:SetPoint("TOPLEFT", card, "TOPRIGHT", 2, 0)   -- opens beside the card
   classMenu:Show()
@@ -999,8 +1139,11 @@ local function CreateCard(parent, index)
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
     GameTooltip:AddLine(e.name)
     GameTooltip:AddLine("ID " .. e.id, 0.7, 0.7, 0.7)
-    if e.ctype and e.ctype ~= "Uncategorized" then
+    if e.ctype and e.ctype ~= "Uncategorized" and e.ctype ~= "Not specified" then
       GameTooltip:AddLine("Type: " .. e.ctype, 0.7, 0.7, 0.7)   -- Beast, Humanoid, Undead...
+    end
+    if e.level and e.level ~= "" then
+      GameTooltip:AddLine("Level " .. e.level, 0.7, 0.7, 0.7)   -- "20", "34 - 35", or "??"
     end
     if e.class ~= "normal" then
       local c = CLASS_COLORS[e.class] or { 1, 1, 1 }
@@ -1019,6 +1162,9 @@ local function CreateCard(parent, index)
     if e.where then
       GameTooltip:AddLine(e.where, 0.6, 0.6, 0.6, true)   -- true = wrap long text
     end
+    if e.seenAt and e.seenAt > 0 then
+      GameTooltip:AddLine("Last seen: " .. ns.DateTimeText(e.seenAt), 0.7, 0.7, 0.7)
+    end
     if e.kills > 0 then
       GameTooltip:AddLine("Kills: " .. e.kills, 1, 1, 1)
       if e.last and e.last > 0 then
@@ -1033,7 +1179,7 @@ local function CreateCard(parent, index)
     else
       GameTooltip:AddLine("All stars earned", 0, 1, 0)
     end
-    GameTooltip:AddLine("Click: details   Right-click: set class", 0.5, 0.5, 0.5)
+    GameTooltip:AddLine("Click: details   Right-click: quest mob, designation, not in game", 0.5, 0.5, 0.5)
     GameTooltip:Show()
   end)
   card:SetScript("OnLeave", function() GameTooltip:Hide() end)

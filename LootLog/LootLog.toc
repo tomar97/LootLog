@@ -1,20 +1,24 @@
 ## Interface: 16001
 ## Title: LootLog
+## Version: 1.0
+## Notes: Logs loot by source, zone, and event
 ## SavedVariables: LootLogDB
+
+# LOAD ORDER MATTERS: files run top to bottom.
+# Core.lua must be first because every other file uses what it defines.
+# UI.lua is last because it ties the pages together.
+# A new .lua file that is NOT listed here will silently not load.
 Core.lua
-Capture.lua
-PageMobs.lua
-PageEvents.lua
-UI.lua
-Pagehunt.lua
-Seed_A_Neutral.lua
 ZoneData.lua
-Seed_A_Hostile.lua
-Seed_H_Neutral.lua
-Seed_H_Hostile.lua
 FishData.lua
-PageFishing.lua
-Seed_Zephras_Isle.lua
 ClassData.lua
 Messages.lua
+BossData.lua
 Tooltips.lua
+Seed_Creatures.lua
+Capture.lua
+PageEvents.lua
+PageMobs.lua
+PageHunt.lua
+PageFishing.lua
+UI.lua

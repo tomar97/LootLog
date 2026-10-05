@@ -56,3 +56,40 @@ pcall(function()
     ns.tooltipHooked = true
   end
 end)
+
+
+-- ===== NAMES OF OBJECTS YOU POINT AT =====
+-- A chest, a mining vein, a herb: when you point at one the game shows its
+-- name in the tooltip. We remember the last one, so that loot from an object
+-- can be named ("Sturdy Chest") on the Gathering page. Capture.lua reads
+-- ns.lastObject when loot opens.
+ns.lastObject = nil   -- { name = "Sturdy Chest", time = GetTime() }
+
+local function NoteObjectTooltip(tooltip)
+  pcall(function()
+    if tooltip.GetUnit then
+      local _, unit = tooltip:GetUnit()
+      if unit then return end                 -- creatures and players are not objects
+    end
+    local fs = _G["GameTooltipTextLeft1"]
+    local text = fs and fs:GetText()
+    if type(text) == "string" and text ~= "" and not (issecretvalue and issecretvalue(text)) then
+      ns.lastObject = { name = text, time = GetTime() }
+    end
+  end)
+end
+
+pcall(function()
+  if TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall
+     and Enum and Enum.TooltipDataType and Enum.TooltipDataType.Object then
+    TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Object, function(tooltip)
+      if tooltip == GameTooltip then NoteObjectTooltip(tooltip) end
+    end)
+  elseif GameTooltip and GameTooltip.HookScript then
+    -- older way: any tooltip shown in the default spot (not on a button) is a world object
+    GameTooltip:HookScript("OnShow", function(tooltip)
+      local owner = tooltip.GetOwner and tooltip:GetOwner()
+      if owner == UIParent or owner == WorldFrame then NoteObjectTooltip(tooltip) end
+    end)
+  end
+end)

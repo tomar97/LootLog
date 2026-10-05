@@ -716,8 +716,8 @@ ns.FishList = {
 -- Order the sections appear in
 ns.FISH_SECTION_ORDER = {
   "Fish", "Big fish", "Quest fish and items", "Food, drink and reagents", "Materials",
-  "Containers and bags", "Gear", "Recipes and patterns",
-  "Potions and scrolls", "Junk", "Other", "Not in your list",
+  "Containers and bags", "Recipes and patterns",
+  "Potions and scrolls", "Junk", "Other", "Not in your list", "Gear",   -- Gear is last: it is very rare
 }
 
 -- Name rules, checked first. pattern is a Lua pattern matched against the item name.

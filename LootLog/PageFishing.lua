@@ -69,8 +69,8 @@ local zoneRows, tiles, headers = {}, {}, {}   -- pools of reusable frames
 
 -- Which section an item belongs to (see the bottom of FishData.lua).
 -- row is the item's entry in ns.FishList, or nil for an item not in the list.
-local function SectionOf(row)
-  return ns.FishSectionOfRow(row)   -- shared with the chat messages (Core.lua)
+local function SectionOf(row, itemID)
+  return ns.FishSectionOfRow(row, itemID)   -- shared with the chat messages (Core.lua)
 end
 
 -- Returns a table describing everything the page needs:
@@ -147,7 +147,7 @@ local function BuildFish(db, s)
                  or (s.fishShow == "caught" and count > 0)
                  or (s.fishShow == "notcaught" and count == 0)
     if show then
-      local sec = SectionOf(row)
+      local sec = SectionOf(row, itemID)
       -- Stars come from your catches in ALL zones added together, using the
       -- numbers for this section in FishData.lua (ns.FISH_STAR_TIERS).
       local tiers = (ns.FISH_STAR_TIERS and ns.FISH_STAR_TIERS[sec]) or ns.FISH_STAR_DEFAULT or { 1 }
@@ -161,6 +161,7 @@ local function BuildFish(db, s)
         id = itemID,
         name = (row and row.name) or evName[itemID] or ("Item " .. itemID),
         type = row and row.type,
+        unlisted = (row == nil),   -- not in FishData.lua; it was sorted into a section automatically
         skill = row and row.skill,
         count = count,
         total = itemTotal[itemID] or 0,
@@ -340,6 +341,9 @@ local function GetTile(i)
       GameTooltip:AddLine("All stars earned", 0, 1, 0)
     end
     if e.skill then GameTooltip:AddLine("Needs fishing skill " .. e.skill, 0.6, 0.8, 1) end
+    if e.unlisted then
+      GameTooltip:AddLine("Not in your fishing list file yet. Sorted into this section automatically.", 1, 0.8, 0.4, true)
+    end
     if e.type then GameTooltip:AddLine("Type: " .. e.type, 0.6, 0.6, 0.6) end
     if e.zones then
       local names = {}

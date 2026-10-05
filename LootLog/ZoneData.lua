@@ -1621,6 +1621,13 @@ local ZONES = {
   {16593,"Zephras Isle"},   -- new zone; ID as you gave it (the map ID in game is 2521)
 }
 
+-- Locations used by the WoW Forever creature lists (Seed_Creatures.lua) that
+-- are not in the list above. They have no area ID here.
+local EXTRA_LOCATIONS = {
+  "Scarlet Enclave", "Riverglades", "Karazhan Crypts", "Storm Cliffs", "Darkspear Islands",
+  "The Burning of Andorhal", "Mount Hyjal", "Shen'dralas", "Eastern Kingdoms", "Kalimdor",
+}
+
 ns.ZONE_NAME, ns.ZONE_IDS, ns.ZONE_UNUSED = {}, {}, {}
 for _, row in ipairs(ZONES) do
   local id, name, unused = row[1], row[2], row[3]
@@ -1628,4 +1635,7 @@ for _, row in ipairs(ZONES) do
   ns.ZONE_IDS[name] = ns.ZONE_IDS[name] or {}
   table.insert(ns.ZONE_IDS[name], id)
   if unused then ns.ZONE_UNUSED[id] = true end
+end
+for _, name in ipairs(EXTRA_LOCATIONS) do
+  ns.ZONE_IDS[name] = ns.ZONE_IDS[name] or {}   -- known as a location, with no ID
 end

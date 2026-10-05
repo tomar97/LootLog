@@ -188,7 +188,7 @@ local function GetMobRow(i)
   local b = mobRows[i]
   if b then return b end            -- already created, reuse it
   b = CreateFrame("Button", nil, ns.ui.mobContent)
-  b:SetSize(160, 20)
+  b:SetSize(200, 20)
   b:SetPoint("TOPLEFT", 0, -(i - 1) * 20)   -- stack rows 20px apart
   b.sel = b:CreateTexture(nil, "BACKGROUND")      -- "selected" highlight
   b.sel:SetAllPoints()
@@ -199,7 +199,7 @@ local function GetMobRow(i)
   b.hl:SetColorTexture(1, 1, 1, 0.08)
   b.text = b:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   b.text:SetPoint("LEFT", 4, 0)
-  b.text:SetWidth(154)
+  b.text:SetWidth(194)
   b.text:SetJustifyH("LEFT")
   b.text:SetWordWrap(false)
   b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
@@ -236,7 +236,7 @@ local function GetDropRow(i)
   local r = dropRows[i]
   if r then return r end
   r = CreateFrame("Frame", nil, ns.ui.dropContent)
-  r:SetSize(470, 20)
+  r:SetSize(465, 20)
   r:SetPoint("TOPLEFT", 0, -(i - 1) * 20)
   r:EnableMouse(true)               -- needed so the row receives hover events
   r.icon = r:CreateTexture(nil, "ARTWORK")
@@ -257,11 +257,22 @@ local function GetDropRow(i)
   r.id   = fs(216, 55)
   r.qty  = fs(276, 40)
   r.rate = fs(320, 140)
+  -- A thin line across the top of the row, shown only on the divider above the quest items
+  r.line = r:CreateTexture(nil, "ARTWORK")
+  r.line:SetColorTexture(1, 1, 1, 0.3)
+  r.line:SetPoint("TOPLEFT", 0, -1)
+  r.line:SetPoint("TOPRIGHT", 0, -1)
+  r.line:SetHeight(1)
+  r.line:Hide()
   r:SetScript("OnEnter", function(self)
     if self.link or self.tipLines then
       GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
       if self.link then
         GameTooltip:SetHyperlink(self.link)   -- an item row: the item tooltip
+        if self.extra then                     -- sale details under the item tooltip
+          GameTooltip:AddLine(" ")
+          for _, line in ipairs(self.extra) do GameTooltip:AddLine(line, 1, 1, 1) end
+        end
       else
         -- the coin row: the lines built by ns.CoinTipLines (title first)
         for i, line in ipairs(self.tipLines) do
@@ -309,10 +320,35 @@ local function RenderExpanded(db, mobs, sortKey)
       lines[#lines + 1] = string.format("    |T%s:14|t Coin  %s   %s",
         ns.COIN_ICON, ns.FormatMoney(m.gold), rate)
     end
-    for _, d in ipairs(SortedDrops(db, m)) do
+    -- Ordinary items first, then a divider and the quest items
+    local regular, quest = ns.SplitQuestItems(db, SortedDrops(db, m))
+    local function addItem(d)
       local rate = ns.RateText(d.it.drops, m.kills)
       lines[#lines + 1] = string.format("    %s [ID %d] x%d   %s",
         ns.ItemText(db, d.id), d.id, d.it.qty, rate)
+    end
+    for _, d in ipairs(regular) do addItem(d) end
+
+    -- Gold made from selling these items (every source of the item, vendor and auction house)
+    local soldLines, soldTotal = {}, 0
+    for _, d in ipairs(regular) do
+      local sr, gold, count = ns.SaleTotals(db, d.id)
+      if sr and gold > 0 then
+        soldLines[#soldLines + 1] = string.format("    %s  x%d sold   %s", ns.ItemText(db, d.id), count, ns.FormatMoney(gold))
+        soldTotal = soldTotal + gold
+      end
+    end
+    if #soldLines > 0 then
+      lines[#lines + 1] = "    |cff777777------------------------------|r"
+      lines[#lines + 1] = "    |cffffd100Gold made from selling these items|r"
+      for _, l in ipairs(soldLines) do lines[#lines + 1] = l end
+      lines[#lines + 1] = "    |cffffd100Total|r   " .. ns.FormatMoney(soldTotal)
+    end
+
+    if #quest > 0 then
+      lines[#lines + 1] = "    |cff777777------------------------------|r"
+      lines[#lines + 1] = "    |cffffd100Quest items|r"
+      for _, d in ipairs(quest) do addItem(d) end
     end
     lines[#lines + 1] = " "   -- blank spacer line between mobs
   end
@@ -438,6 +474,8 @@ function ns.RefreshMobs(db)
     local coinDrops = m.goldDrops or 0
     r.link = nil
     r.tipLines = ns.CoinTipLines(m, m.kills)   -- hover text for the coin row
+    r.line:Hide()
+    r.icon:Show()
     r.icon:SetTexture(ns.COIN_ICON)
     r.name:SetText("Coin  " .. ns.FormatMoney(m.gold))
     r.id:SetText("-")
@@ -446,11 +484,20 @@ function ns.RefreshMobs(db)
     r:Show()
   end
 
-  for i, d in ipairs(drops) do
-    local r = GetDropRow(i + first)
+  -- Ordinary items first, then the gold made from selling them, then a divider and the quest items
+  for _, rr in ipairs(dropRows) do rr.extra = nil end   -- (only the "gold made" rows use this)
+  local regular, quest = ns.SplitQuestItems(db, drops)
+  local rowIndex = first
+
+  -- Fills the next row with one item
+  local function fillItem(d)
+    rowIndex = rowIndex + 1
+    local r = GetDropRow(rowIndex)
     local link = db.items and db.items[d.id]
     r.link = link                       -- used by the hover tooltip
     r.tipLines = nil                    -- (only the coin row uses this)
+    r.line:Hide()
+    r.icon:Show()
     r.icon:SetTexture(ns.GetIcon(db, d.id))
     r.name:SetText(link or ("item:" .. d.id))
     r.id:SetText(d.id)
@@ -459,8 +506,80 @@ function ns.RefreshMobs(db)
     r.rate:SetText(ns.RateText(d.it.drops, m.kills))
     r:Show()
   end
-  for i = #drops + first + 1, #dropRows do dropRows[i]:Hide() end
-  ui.dropContent:SetHeight(math.max((#drops + first) * 20, 1))
+
+  for _, d in ipairs(regular) do fillItem(d) end
+
+  -- Gold made from selling these items (vendors and auction house). Sales are
+  -- counted per item from every source, so this is what the item brought in
+  -- overall, not only what this creature's drops did.
+  local sold, soldTotal = {}, 0
+  for _, d in ipairs(regular) do
+    local sr, gold, count = ns.SaleTotals(db, d.id)
+    if sr and gold > 0 then
+      sold[#sold + 1] = { d = d, sr = sr, gold = gold, count = count }
+      soldTotal = soldTotal + gold
+    end
+  end
+  if #sold > 0 then
+    rowIndex = rowIndex + 1
+    local r = GetDropRow(rowIndex)       -- the divider
+    r.link, r.tipLines = nil, nil
+    r.line:Show()
+    r.icon:Hide()
+    r.name:SetText("|cffffd100Gold made from selling these items|r")
+    r.id:SetText("")
+    r.qty:SetText("")
+    r.rate:SetText("")
+    r:Show()
+    for _, e in ipairs(sold) do
+      rowIndex = rowIndex + 1
+      local row = GetDropRow(rowIndex)
+      local link = db.items and db.items[e.d.id]
+      row.link = link
+      row.tipLines = nil
+      row.extra = {
+        string.format("Sold to vendors: %d for %s", e.sr.vendorCount or 0, ns.FormatMoney(e.sr.vendorGold or 0)),
+        string.format("Sold at the auction house: %d for %s", e.sr.aucCount or 0, ns.FormatMoney(e.sr.aucGold or 0)),
+        "(counts this item from every source)",
+      }
+      row.line:Hide()
+      row.icon:Show()
+      row.icon:SetTexture(ns.GetIcon(db, e.d.id))
+      row.name:SetText(link or ("item:" .. e.d.id))
+      row.id:SetText("")
+      row.qty:SetText("x" .. e.count)
+      row.rate:SetText(ns.FormatMoney(e.gold))
+      row:Show()
+    end
+    rowIndex = rowIndex + 1
+    local tr = GetDropRow(rowIndex)      -- the total
+    tr.link, tr.tipLines = nil, nil
+    tr.line:Hide()
+    tr.icon:Hide()
+    tr.name:SetText("|cffffd100Total|r")
+    tr.id:SetText("")
+    tr.qty:SetText("")
+    tr.rate:SetText(ns.FormatMoney(soldTotal))
+    tr:Show()
+  end
+
+  if #quest > 0 then
+    -- The divider: a row with a line across it and a label
+    rowIndex = rowIndex + 1
+    local r = GetDropRow(rowIndex)
+    r.link = nil
+    r.tipLines = nil
+    r.line:Show()
+    r.icon:Hide()
+    r.name:SetText("|cffffd100Quest items|r")
+    r.id:SetText("")
+    r.qty:SetText("")
+    r.rate:SetText("")
+    r:Show()
+    for _, d in ipairs(quest) do fillItem(d) end
+  end
+  for i = rowIndex + 1, #dropRows do dropRows[i]:Hide() end
+  ui.dropContent:SetHeight(math.max(rowIndex * 20, 1))
 end
 
 
@@ -566,9 +685,9 @@ function ns.CreateMobPanel(ui)
   local ms = CreateFrame("ScrollFrame", nil, split, "UIPanelScrollFrameTemplate")
   ms:SetPoint("TOPLEFT", 0, 0)
   ms:SetPoint("BOTTOMLEFT", 0, 18)   -- leaves a line underneath for the totals
-  ms:SetWidth(170)
+  ms:SetWidth(210)   -- wide enough for long creature names
   local mc = CreateFrame("Frame", nil, ms)
-  mc:SetSize(165, 10)
+  mc:SetSize(205, 10)
   ms:SetScrollChild(mc)
   ui.mobContent = mc
 
@@ -579,8 +698,8 @@ function ns.CreateMobPanel(ui)
 
   -- Right: header text (3 lines: name, kills, zones)
   ui.mobHeader = split:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-  ui.mobHeader:SetPoint("TOPLEFT", 205, 0)
-  ui.mobHeader:SetWidth(470)
+  ui.mobHeader:SetPoint("TOPLEFT", 245, 0)
+  ui.mobHeader:SetWidth(465)
   ui.mobHeader:SetJustifyH("LEFT")
 
   -- Right: column headings. x positions must line up with the row
@@ -590,7 +709,7 @@ function ns.CreateMobPanel(ui)
   ui.dropHeads = {}
   local function col(key, txt, cx, w)
     local hb = CreateFrame("Button", nil, split)
-    hb:SetPoint("TOPLEFT", 205 + cx, -56)
+    hb:SetPoint("TOPLEFT", 245 + cx, -56)
     hb:SetSize(w, 16)
     hb.text = hb:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     hb.text:SetPoint("LEFT", 0, 0)
@@ -618,10 +737,10 @@ function ns.CreateMobPanel(ui)
 
   -- Right: scrolling table of the selected mob's drops
   local ds = CreateFrame("ScrollFrame", nil, split, "UIPanelScrollFrameTemplate")
-  ds:SetPoint("TOPLEFT", 205, -74)
+  ds:SetPoint("TOPLEFT", 245, -74)
   ds:SetPoint("BOTTOMRIGHT", -24, 0)
   local dc = CreateFrame("Frame", nil, ds)
-  dc:SetSize(470, 10)
+  dc:SetSize(465, 10)
   ds:SetScrollChild(dc)
   ui.dropContent = dc
 

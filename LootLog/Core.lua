@@ -87,11 +87,12 @@ ns.MONEY_SLOT = (Enum and Enum.LootSlotType and Enum.LootSlotType.Money) or 2
 -- are the same for every character and are kept at the top level instead.
 
 -- Parts of the data that belong to one character
-local PER_CHARACTER = { "mobs", "known", "events", "gold", "quests", "gather", "visited", "zonesDone" }
+local PER_CHARACTER = { "mobs", "known", "events", "gold", "moneyIn", "vendors", "sales", "crafting", "trades",
+                        "quests", "gather", "visited", "zonesDone" }
 
 -- Parts shared by every character
 local SHARED = { settings = true, classes = true, notInGame = true,
-                 items = true, icons = true, nodeNames = true }
+                 items = true, icons = true, nodeNames = true, questItems = true }
 
 local root, cur, curKey   -- remembered between calls so lookups stay cheap
 
@@ -178,6 +179,7 @@ end
 local function MergeAll(r)
   local out = {
     mobs = {}, known = {}, events = {}, quests = {}, gather = {}, visited = {}, zonesDone = {},
+    moneyIn = {}, vendors = {}, sales = {}, crafting = {}, trades = {}, questItems = r.questItems or {},
     gold = { total = 0, drops = 0, events = {} },
     settings = r.settings, classes = r.classes, notInGame = r.notInGame,
     items = r.items, icons = r.icons, nodeNames = r.nodeNames,
@@ -213,6 +215,7 @@ local function MergeAll(r)
       o.name = o.name or k.name
       o.ctype = o.ctype or k.ctype
       o.uclass = o.uclass or k.uclass
+      if k.lastSeen and (not o.lastSeen or k.lastSeen > o.lastSeen) then o.lastSeen = k.lastSeen end
       for z in pairs(k.zones or {}) do o.zones[z] = true end
       if k.fac then
         o.fac = o.fac or {}
@@ -236,6 +239,48 @@ local function MergeAll(r)
         end
       end
     end
+
+    -- Gold received from vendors, mail, and trades
+    for cat, mi in pairs(c.moneyIn or {}) do
+      local o = out.moneyIn[cat]
+      if not o then o = { total = 0, times = 0, zones = {} }; out.moneyIn[cat] = o end
+      o.total = o.total + (mi.total or 0)
+      o.times = o.times + (mi.times or 0)
+      for zone, n in pairs(mi.zones or {}) do o.zones[zone] = (o.zones[zone] or 0) + n end
+    end
+
+    -- Vendors: what you sold to and bought from each one, by zone
+    for zone, names in pairs(c.vendors or {}) do
+      local oz = out.vendors[zone]
+      if not oz then oz = {}; out.vendors[zone] = oz end
+      for vname, v in pairs(names) do
+        local ov = oz[vname]
+        if not ov then ov = { sold = 0, soldTimes = 0, bought = {} }; oz[vname] = ov end
+        ov.sold = ov.sold + (v.sold or 0)
+        ov.soldTimes = ov.soldTimes + (v.soldTimes or 0)
+        for itemID, qty in pairs(v.bought or {}) do ov.bought[itemID] = (ov.bought[itemID] or 0) + qty end
+      end
+    end
+
+    -- What you sold of each item (to vendors and at the auction house)
+    for itemID, s in pairs(c.sales or {}) do
+      local o = out.sales[itemID]
+      if not o then o = { vendorCount = 0, vendorGold = 0, aucCount = 0, aucGold = 0 }; out.sales[itemID] = o end
+      o.vendorCount = o.vendorCount + (s.vendorCount or 0)
+      o.vendorGold = o.vendorGold + (s.vendorGold or 0)
+      o.aucCount = o.aucCount + (s.aucCount or 0)
+      o.aucGold = o.aucGold + (s.aucGold or 0)
+    end
+
+    -- Things you crafted, by kind of crafting
+    for craftType, items in pairs(c.crafting or {}) do
+      local o = out.crafting[craftType]
+      if not o then o = {}; out.crafting[craftType] = o end
+      for itemID, n in pairs(items) do o[itemID] = (o[itemID] or 0) + n end
+    end
+
+    -- Trades: all characters' trades in one list, newest first
+    for _, t in ipairs(c.trades or {}) do out.trades[#out.trades + 1] = t end
 
     -- Coin
     local g = c.gold
@@ -296,9 +341,10 @@ function ns.ViewDB()
   local c = CharData()
   return {
     mobs = c.mobs, known = c.known, events = c.events, gold = c.gold, quests = c.quests,
-    gather = c.gather, visited = c.visited, zonesDone = c.zonesDone,
+    gather = c.gather, visited = c.visited, zonesDone = c.zonesDone, moneyIn = c.moneyIn, vendors = c.vendors,
+    sales = c.sales, crafting = c.crafting, trades = c.trades,
     settings = r.settings, classes = r.classes, notInGame = r.notInGame,
-    items = r.items, icons = r.icons, nodeNames = r.nodeNames,
+    items = r.items, icons = r.icons, nodeNames = r.nodeNames, questItems = r.questItems,
   }
 end
 
@@ -481,32 +527,116 @@ ns.USE_GAME_CLASSIFICATION = true
 -- Maps the game's UnitClassification() text to our classes
 local AUTO_CLASS = { elite = "elite", rare = "rare", rareelite = "rare", worldboss = "boss" }
 
--- Returns the creature's class: "normal", "elite", "rare", "boss",
--- "critter", or "quest":
---   1. your saved choice (including an explicit "normal"), else
---   2. "critter" if the creature is a critter type (isCritter = true), else
---   3. the default in ClassData.lua (ns.SeedClass), else
---   4. the game's classification recorded when you saw it, else
---   5. "normal"
-function ns.GetClass(db, npcID, isCritter)
-  local chosen = db.classes and db.classes[npcID]
-  if chosen then return chosen end
+-- ===== A CREATURE'S CLASS (designation) =====
+-- Classes: "normal", "elite", "rare", "boss", "critter", "quest".
+-- The designation (elite / rare / boss) comes from the creature list in
+-- Seed_Creatures.lua. You normally only mark quest creatures, since the list
+-- cannot know which creatures are quest creatures, or change a designation
+-- you think is wrong. Both are saved in db.classes (shared by all characters).
+
+-- The designation of a creature, ignoring quest status:
+--   1. "critter" for a critter type (isCritter = true)
+--   2. the designation in the creature list (a creature in the list with no
+--      designation is "normal")
+--   3. for a creature that is not in the list: what the game reported when
+--      you met it (elite, rare, world boss)
+--   4. "normal"
+function ns.DesignationClass(db, npcID, isCritter)
   if isCritter then return "critter" end
-  local baked = ns.SeedClass and ns.SeedClass[npcID]   -- defaults saved in ClassData.lua
-  if baked then return baked end
-  if ns.USE_GAME_CLASSIFICATION then
-    local k = db.known and db.known[npcID]
-    if type(k) == "table" and k.uclass then return AUTO_CLASS[k.uclass] or "normal" end
+
+  -- What the game itself showed when you met the creature wins over the list,
+  -- so the Hunting Log corrects itself: a level of ?? is always a boss, and
+  -- otherwise the game's elite / rare / world boss mark decides.
+  local k = db.known and db.known[npcID]
+  if type(k) == "table" then
+    if ns.SeenAsBoss(k) then return "boss" end         -- level ?? at the top level is a boss
+    if ns.USE_GAME_CLASSIFICATION and k.uclass then
+      return AUTO_CLASS[k.uclass] or "normal"          -- (normal, trivial, minor creatures are "normal")
+    end
+  end
+
+  -- Otherwise the creature list. A level of ?? always means a boss.
+  local row = ns.SeedRow(npcID)
+  if row then
+    if row.level == "??" then return "boss" end
+    return row.class or "normal"
   end
   return "normal"
 end
 
--- Saves a creature's class. "normal" is saved too (not removed), so a
--- creature the game calls elite stays normal if you say so.
+-- The class a creature has before any choice of yours: a critter type, else
+-- the default in ClassData.lua (quest creatures), else its designation.
+function ns.BaseClass(db, npcID, isCritter)
+  if isCritter then return "critter" end
+  local baked = ns.SeedClass and ns.SeedClass[npcID]   -- defaults saved in ClassData.lua
+  if baked then return baked end
+  return ns.DesignationClass(db, npcID, isCritter)
+end
+
+-- The creature's class: your saved choice if you made one, else its base class.
+function ns.GetClass(db, npcID, isCritter)
+  local chosen = db.classes and db.classes[npcID]
+  if chosen then return chosen end
+  return ns.BaseClass(db, npcID, isCritter)
+end
+
+-- Saves a class exactly as given (kept for old code; the menu uses
+-- SetDesignation and SetQuest below).
 function ns.SetClass(npcID, class)
   local db = ns.DB()
   db.classes = db.classes or {}
   db.classes[npcID] = class
+end
+
+-- You change a creature's designation. If your choice is the same as what it
+-- would be anyway, the saved choice is removed, so db.classes only ever holds
+-- real changes (they can be reviewed with Show > Changed by you).
+function ns.SetDesignation(npcID, class, isCritter)
+  local db = ns.DB()
+  db.classes = db.classes or {}
+  if class == ns.BaseClass(db, npcID, isCritter) then
+    db.classes[npcID] = nil
+  else
+    db.classes[npcID] = class
+  end
+end
+
+-- You mark a creature as a quest creature (on = true), or take that away
+-- (on = false, which returns it to its designation).
+function ns.SetQuest(npcID, on, isCritter)
+  local db = ns.DB()
+  db.classes = db.classes or {}
+  local base = ns.BaseClass(db, npcID, isCritter)
+  if on then
+    db.classes[npcID] = (base == "quest") and nil or "quest"
+  else
+    -- If the default itself says quest (ClassData.lua), say its designation instead
+    db.classes[npcID] = (base == "quest") and ns.DesignationClass(db, npcID, isCritter) or nil
+  end
+end
+
+-- Removes saved choices that are now the same as the default (for example a
+-- class you set before the creature list gave it a designation). Called at login.
+function ns.CleanClasses()
+  local db = ns.DB()
+  if not db.classes then return end
+
+  -- Choices to forget outright, so these creatures go back to the creature list:
+  --   Urs'anah (251115) was set to boss before the list existed; the list calls him normal.
+  --   Captain Flat Tusk (5824) was set to elite; he is a rare elite, and rare elites stay rare.
+  local FORGET = { 251115, 5824 }
+  for _, id in ipairs(FORGET) do db.classes[id] = nil end
+
+  for id, class in pairs(db.classes) do
+    local crit = ns.IsCritterType(ns.CreatureCtype(db, id))
+    if class == ns.BaseClass(db, id, crit) then db.classes[id] = nil end
+  end
+end
+
+-- Does a row of the creature list belong in the log of this faction ("A" or
+-- "H")? Rows carry A and H fields (hostile / neutral toward each faction).
+function ns.SeedHas(c, letter)
+  return c[letter] ~= nil or (c.fac ~= nil and c.fac:find(letter, 1, true) ~= nil)
 end
 
 -- Returns the star thresholds for a class (falls back to the normal ones)
@@ -825,8 +955,12 @@ end
 
 -- Which section an item belongs to (see the bottom of FishData.lua).
 -- row is the item's FishData.lua row, or nil for an item not in the list.
-function ns.FishSectionOfRow(row)
-  if not row then return "Not in your list" end
+function ns.FishSectionOfRow(row, itemID)
+  if not row then
+    -- Not in FishData.lua: sort it into an existing section if we can
+    if itemID then return ns.ClassifyUnlistedFish(itemID) end
+    return "Not in your list"
+  end
   local override = ns.FISH_ITEM_SECTION and ns.FISH_ITEM_SECTION[row.id]   -- a single item placed by hand
   if override then return override end
   for _, rule in ipairs(ns.FISH_NAME_RULES or {}) do
@@ -837,7 +971,7 @@ end
 
 -- The catches needed for each star of an item, and its section name.
 function ns.FishTiers(itemID)
-  local section = ns.FishSectionOfRow(ns.FishRow(itemID))
+  local section = ns.FishSectionOfRow(ns.FishRow(itemID), itemID)
   local tiers = (ns.FISH_STAR_TIERS and ns.FISH_STAR_TIERS[section]) or ns.FISH_STAR_DEFAULT or { 1 }
   return tiers, section
 end
@@ -932,4 +1066,208 @@ function ns.SaveSession()
   local sess = ns.session
   if sess.kills == 0 and sess.items == 0 and sess.coin == 0 then return end
   CharData().lastSession = ns.SessionSnapshot()
+end
+
+
+-- ===== QUEST ITEMS =====
+-- Items that belong to quests are listed apart from ordinary drops. An item
+-- counts as a quest item if the loot window said so when it dropped
+-- (saved in the shared db.questItems) or the game's item data puts it in the
+-- Quest item class.
+local QUEST_CLASS = (Enum and Enum.ItemClass and Enum.ItemClass.Questitem) or 12
+local questClassCache = {}   -- itemID -> true / false, so the game is asked once
+
+function ns.IsQuestItem(db, itemID)
+  if db.questItems and db.questItems[itemID] then return true end
+  local cached = questClassCache[itemID]
+  if cached == nil then
+    cached = false
+    pcall(function()
+      if C_Item and C_Item.GetItemInfoInstant then
+        local _, _, _, _, _, classID = C_Item.GetItemInfoInstant(itemID)   -- (6th value is the item class)
+        cached = (classID == QUEST_CLASS)
+      end
+    end)
+    questClassCache[itemID] = cached
+  end
+  return cached
+end
+
+-- Splits a list of drops (each with an .id) into ordinary items and quest
+-- items. Returns two lists; the order inside each is kept.
+function ns.SplitQuestItems(db, drops)
+  local regular, quest = {}, {}
+  for _, d in ipairs(drops) do
+    if ns.IsQuestItem(db, d.id) then quest[#quest + 1] = d else regular[#regular + 1] = d end
+  end
+  return regular, quest
+end
+
+
+-- ===== WHERE THE GAME DISAGREES WITH THE CREATURE LIST =====
+-- Compares what the game showed you (db.known) with the creature list
+-- (Seed_Creatures.lua): name, type, designation, level, and how each faction
+-- is treated. Returns a sorted list of text lines, one per creature that
+-- differs. The Hunting Log already goes by the game in these cases; this just
+-- lets you see where it happened.
+function ns.Corrections(db)
+  local out = {}
+  for id in pairs(db.known or {}) do
+    local k = ns.GetKnown(db, id)
+    local row = ns.SeedRow(id)
+    if k and row then
+      local diffs = {}
+      if k.name and k.name ~= row.name then
+        diffs[#diffs + 1] = "name (list: " .. row.name .. ")"
+      end
+      -- ("Not specified" is the game's wording for the list's "Uncategorized")
+      if k.ctype and row.ctype and k.ctype ~= row.ctype
+         and not (k.ctype == "Not specified" and row.ctype == "Uncategorized") then
+        diffs[#diffs + 1] = "type " .. k.ctype .. " (list: " .. row.ctype .. ")"
+      end
+
+      -- Designation. A level of ?? always means a boss.
+      local listClass = (row.level == "??") and "boss" or (row.class or "normal")
+      local seenClass
+      if ns.SeenAsBoss(k) then seenClass = "boss"
+      elseif k.uclass then seenClass = AUTO_CLASS[k.uclass] or "normal" end
+      if seenClass and not ns.IsCritterType(k.ctype or row.ctype) and seenClass ~= listClass then
+        diffs[#diffs + 1] = "designation " .. seenClass .. " (list: " .. listClass .. ")"
+      end
+
+      -- Level: a single number, a range like "34 - 35", or ??
+      -- (a ?? seen below the top level says nothing: creatures far above your level show ?? too)
+      if type(k.level) == "number" and (k.level >= 0 or ns.SeenAsBoss(k)) and row.level and row.level ~= "" then
+        local lo, hi = row.level:match("^(%d+)%s*%-%s*(%d+)$")
+        if not lo then lo = row.level:match("^(%d+)$"); hi = lo end
+        if row.level == "??" then
+          if k.level ~= -1 then diffs[#diffs + 1] = "level " .. k.level .. " (list: ??)" end
+        elseif k.level == -1 then
+          diffs[#diffs + 1] = "level ?? (list: " .. row.level .. ")"
+        elseif lo and (k.level < tonumber(lo) or k.level > tonumber(hi)) then
+          diffs[#diffs + 1] = "level " .. k.level .. " (list: " .. row.level .. ")"
+        end
+      end
+
+      -- Hostility toward each faction
+      for _, letter in ipairs({ "A", "H" }) do
+        local seen, listed = k.host and k.host[letter], row[letter]
+        if seen and listed and seen ~= listed then
+          diffs[#diffs + 1] = (letter == "A" and "Alliance " or "Horde ") .. seen .. " (list: " .. listed .. ")"
+        end
+      end
+
+      if #diffs > 0 then
+        out[#out + 1] = (k.name or row.name) .. " (" .. id .. "): " .. table.concat(diffs, ", ")
+      end
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+
+-- ===== THE ?? LEVEL =====
+-- The creature list says a creature with level ?? is a boss. In the game, ?? also
+-- shows for any creature far above YOUR level, so a ?? seen in game only counts
+-- once you are at the top level.
+ns.MAX_LEVEL = 60
+
+-- Did the game show this creature (k = its db.known record) as level ?? to
+-- someone at the top level? (k.level is -1 for ??, k.lvlBy is the player's level.)
+function ns.SeenAsBoss(k)
+  return type(k) == "table" and k.level == -1 and (k.lvlBy or 0) >= ns.MAX_LEVEL
+end
+
+-- ===== SORTING A NEW FISHING CATCH INTO AN EXISTING SECTION =====
+-- For an item that is not in FishData.lua: use the game's own item information
+-- (its class and sub-class, and its name) to pick one of the sections that
+-- already exist. "Not in your list" is only used when the game gives us nothing.
+local FISHY_WORDS = { "fish", "eel", "squid", "snapper", "grouper", "bass", "trout", "salmon",
+                      "catfish", "blackmouth", "sturgeon", "mackerel", "tuna" }
+local CONTAINER_WORDS = { "clam", "crate", "chest", "lockbox", "footlocker", "satchel", "strongbox", "barrel", "cache" }
+
+local function NameHas(name, words)
+  if not name then return false end
+  name = name:lower()
+  for _, w in ipairs(words) do
+    if name:find(w, 1, true) then return true end
+  end
+  return false
+end
+
+function ns.ClassifyUnlistedFish(itemID)
+  local db = ns.DB()
+  local link = db.items and db.items[itemID]
+  local name = link and link:match("%[(.-)%]") or nil
+  if not name then
+    pcall(function() name = (C_Item and C_Item.GetItemNameByID and C_Item.GetItemNameByID(itemID)) or GetItemInfo(itemID) end)
+  end
+  if name and name:find("^%d+ Pound ") then return "Big fish" end
+  if ns.IsQuestItem(db, itemID) then return "Quest fish and items" end
+
+  local classID, subID
+  pcall(function()
+    if C_Item and C_Item.GetItemInfoInstant then
+      local _, _, _, _, _, c, s = C_Item.GetItemInfoInstant(itemID)
+      classID, subID = c, s
+    end
+  end)
+  if not classID then return "Not in your list" end       -- the game gave us nothing to go by
+
+  if classID == 2 or classID == 4 then return "Gear" end  -- weapons and armor
+  if classID == 1 then return "Containers and bags" end
+  if classID == 0 then                                    -- consumables
+    if subID == 1 or subID == 2 or subID == 3 or subID == 4 then return "Potions and scrolls" end
+    return "Food, drink and reagents"
+  end
+  if classID == 5 then return "Food, drink and reagents" end
+  if classID == 7 then                                    -- trade goods
+    if subID == 8 then                                    -- "Meat": a fish, or food
+      return NameHas(name, FISHY_WORDS) and "Fish" or "Food, drink and reagents"
+    end
+    return "Materials"
+  end
+  if classID == 9 then return "Recipes and patterns" end
+  if classID == 12 then return "Quest fish and items" end
+  if classID == 15 then                                   -- miscellaneous
+    if subID == 0 then return "Junk" end
+    if NameHas(name, CONTAINER_WORDS) then return "Containers and bags" end
+    return "Other"
+  end
+  return "Other"
+end
+
+-- ===== WHAT YOU SOLD, BY ITEM =====
+-- db.sales[itemID] = { vendorCount, vendorGold, aucCount, aucGold }: how many
+-- of an item you sold to vendors and at the auction house, and for how much
+-- (copper). Written by Capture.lua. Returns the record or nil, plus the
+-- combined gold and count.
+function ns.SaleTotals(db, itemID)
+  local s = db.sales and db.sales[itemID]
+  if not s then return nil, 0, 0 end
+  return s, (s.vendorGold or 0) + (s.aucGold or 0), (s.vendorCount or 0) + (s.aucCount or 0)
+end
+
+-- ===== ONE-TIME CLEAN-UP OF QUEST REWARDS LOGGED AS RECEIVED ITEMS =====
+-- Before quest rewards were kept out of the Received Items tabs, some were
+-- logged there too. This takes them out once, using the Quest Rewards log.
+function ns.CleanReceived()
+  local db = ns.DB()
+  if db.cleanedQuestRewards then return end
+  db.cleanedQuestRewards = true
+  local other, quest = db.events["Other received"], db.events["Quest"]
+  if not other or not quest then return end
+  for zone, items in pairs(quest) do
+    local oz = other[zone]
+    if oz then
+      for itemID, qe in pairs(items) do
+        local oe = oz[itemID]
+        if oe then
+          oe.count = oe.count - qe.count
+          if oe.count <= 0 then oz[itemID] = nil end
+        end
+      end
+    end
+  end
 end
